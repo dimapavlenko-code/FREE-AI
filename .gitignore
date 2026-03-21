@@ -39,3 +39,46 @@
 
 # debug information files
 *.dwo
+
+# =====================
+# Visual Studio
+# =====================
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+
+# =====================
+# Build Output
+# =====================
+out/
+build/
+bin/
+obj/
+*.exe
+*.dll
+*.lib
+*.pdb
+
+# =====================
+# CMake
+# =====================
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# =====================
+# mbedTLS
+# =====================
+*.o
+*.a
+
+# =====================
+# System Files
+# =====================
+.DS_Store
+Thumbs.db

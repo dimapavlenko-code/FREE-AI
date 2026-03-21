@@ -44,7 +44,7 @@ namespace FreeAI {
                 return false;
             }
 
-            // Setup PK context for ECP Key
+            // Setup PK context for ECDSA Key (secp256k1 - same as Bitcoin)
             ret = mbedtls_pk_setup(pk, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
             if (ret != 0) {
                 std::cerr << "[CRYPTO] PK Setup failed: -0x" << std::hex << -ret << std::dec << std::endl;
@@ -53,9 +53,8 @@ namespace FreeAI {
                 return false;
             }
 
-            // Generate Ed25519 Key (Curve25519)
-            // In mbedTLS 3.6, we access the ECP context directly
-            ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_CURVE25519, mbedtls_pk_ec(*pk),
+            // Generate ECDSA Key with secp256k1 curve (NOT Curve25519)
+            ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256K1, mbedtls_pk_ec(*pk),
                 mbedtls_ctr_drbg_random, &ctr_drbg);
             if (ret != 0) {
                 std::cerr << "[CRYPTO] Key Gen failed: -0x" << std::hex << -ret << std::dec << std::endl;
@@ -93,13 +92,12 @@ namespace FreeAI {
             }
 
             // Parse private key (includes public key)
-            // CORRECTED: Added RNG parameters (nullptr, nullptr won't work in 3.6.x)
             ret = mbedtls_pk_parse_key(pk,
                 reinterpret_cast<const unsigned char*>(privPEM.c_str()),
-                privPEM.size() + 1, // Include null terminator
-                nullptr, 0,         // No password
+                privPEM.size() + 1,
+                nullptr, 0,
                 mbedtls_ctr_drbg_random,
-                &ctr_drbg);         // RNG context
+                &ctr_drbg);
 
             mbedtls_ctr_drbg_free(&ctr_drbg);
             mbedtls_entropy_free(&entropy);
@@ -118,7 +116,7 @@ namespace FreeAI {
 
             mbedtls_pk_context* pk = static_cast<mbedtls_pk_context*>(m_pkContext);
             unsigned char pem_buf[512];
-            
+
             int ret = mbedtls_pk_write_pubkey_pem(pk, pem_buf, sizeof(pem_buf));
             if (ret != 0) {
                 return "";
@@ -132,7 +130,7 @@ namespace FreeAI {
 
             mbedtls_pk_context* pk = static_cast<mbedtls_pk_context*>(m_pkContext);
             unsigned char pem_buf[1024];
-         
+
             int ret = mbedtls_pk_write_key_pem(pk, pem_buf, sizeof(pem_buf));
             if (ret != 0) {
                 return "";
@@ -145,7 +143,7 @@ namespace FreeAI {
             if (!m_valid) return "";
 
             mbedtls_pk_context* pk = static_cast<mbedtls_pk_context*>(m_pkContext);
-            unsigned char sig[64];
+            unsigned char sig[72]; // ECDSA sig is up to 72 bytes (DER encoded)
             size_t sig_len = 0;
 
             // Initialize temporary RNG for signing
@@ -162,14 +160,14 @@ namespace FreeAI {
                 return "";
             }
 
-            // CORRECTED: Added sig_size parameter (sizeof(sig))
+            // ECDSA Sign with SHA256 hash (CORRECT for secp256k1)
             ret = mbedtls_pk_sign(pk,
-                MBEDTLS_MD_NONE,
+                MBEDTLS_MD_SHA256,  // <-- SHA256 for ECDSA (not NONE)
                 static_cast<const unsigned char*>(data),
                 length,
                 sig,
-                sizeof(sig),      // <-- Buffer size
-                &sig_len,         // <-- Output length pointer
+                sizeof(sig),
+                &sig_len,
                 mbedtls_ctr_drbg_random,
                 &ctr_drbg);
 
@@ -181,6 +179,7 @@ namespace FreeAI {
                 return "";
             }
 
+            // Encode to Base64
             unsigned char b64[128];
             size_t b64_len = 0;
             mbedtls_base64_encode(b64, sizeof(b64), &b64_len, sig, sig_len);
@@ -192,7 +191,7 @@ namespace FreeAI {
             const std::string& signatureB64,
             const std::string& pubKeyPEM) {
             // Decode Base64
-            unsigned char sig[64];
+            unsigned char sig[72];
             size_t sig_len = 0;
             int ret = mbedtls_base64_decode(sig, sizeof(sig), &sig_len,
                 reinterpret_cast<const unsigned char*>(signatureB64.c_str()),
@@ -210,8 +209,8 @@ namespace FreeAI {
                 return false;
             }
 
-            // Verify (No RNG needed for verification)
-            ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_NONE,
+            // Verify with SHA256 (CORRECT for ECDSA)
+            ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256,
                 static_cast<const unsigned char*>(data), length,
                 sig, sig_len);
 
@@ -229,7 +228,7 @@ namespace FreeAI {
             auto pemsz = pem.size();
             if (pemsz < 20) return "ERROR";
             std::stringstream ss;
-            
+
             auto pemsz_2 = pemsz / 2;
             for (size_t i = 0; i < 8 && i < pemsz_2; ++i) {
                 ss << std::hex << std::setw(2) << std::setfill('0')

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<StepFilter xmlns="http://schemas.microsoft.com/visualstudio/2012/01/natstepfilter">
+    <Module name="*">
+        <Function name="std::*">
+            <NoStepInto>true</NoStepInto>
+        </Function>
+        <Function name="*allocator*">
+            <NoStepInto>true</NoStepInto>
+        </Function>
+    </Module>
+</StepFilter>

@@ -35,7 +35,9 @@ set(SOURCES
     src/network/Socket.cpp
     src/network/UDPSocket.cpp
     src/network/PeerManager.cpp
-    src/network/PacketSecurity.cpp      # NEW
+    src/network/PacketSecurity.cpp
+    src/network/HolePunchManager.cpp
+    src/network/DHT.cpp              # NEW
     src/crypto/Identity.cpp
     src/utils/Config.cpp
 )
@@ -46,22 +48,13 @@ set(HEADERS
     include/network/UDPSocket.hpp
     include/network/Protocol.hpp
     include/network/PeerManager.hpp
-    include/network/PacketSecurity.hpp  # NEW
+    include/network/PacketSecurity.hpp
+    include/network/HolePunchManager.hpp
+    include/network/DHT.hpp          # NEW
     include/crypto/Identity.hpp
     include/utils/Config.hpp
     include/utils/ThreadUtils.hpp
 )
-
-set(CRYPTO_SOURCES
-    src/crypto/Identity.cpp
-)
-
-set(CRYPTO_HEADERS
-    include/crypto/Identity.hpp
-)
-
-set(SOURCES ${SOURCES} ${CRYPTO_SOURCES})
-set(HEADERS ${HEADERS} ${CRYPTO_HEADERS})
 
 
 # --- Executable ---

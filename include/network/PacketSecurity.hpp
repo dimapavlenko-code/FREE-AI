@@ -24,7 +24,8 @@ namespace FreeAI {
                 size_t dataSize,
                 SecurePacketHeader& outHeader,
                 std::vector<uint8_t>& outPayload,
-                const Crypto::Identity* identity = nullptr);
+                const Crypto::Identity* identity = nullptr,
+                const std::string& senderPubKey = "");
 
             // Generate random nonce
             static uint32_t GenerateNonce();

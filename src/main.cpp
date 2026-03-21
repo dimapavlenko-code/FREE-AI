@@ -51,6 +51,9 @@ int main() {
     peerManager.Start();
 
     std::cout << "[MAIN] Running... Press Enter to stop." << std::endl;
+    // ToDo: In main loop, add periodic DHT stats:
+    std::cout << "[DHT] Known nodes: " << peerManager.GetDHTNodeCount() << std::endl;
+
     std::cin.get();
 
     // 5. Cleanup
