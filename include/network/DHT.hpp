@@ -70,6 +70,7 @@ namespace FreeAI {
             std::thread m_refreshThread;
             std::atomic<bool> m_running;
             mutable std::mutex m_mutex;
+            uint32_t m_lastDhtRefreshTs = 0;
 
             // Pending queries (for FIND_NODE responses)
             std::unordered_map<std::string, std::vector<KBucketEntry>> m_pendingQueries;

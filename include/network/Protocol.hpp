@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <cstdint>
 
 namespace FreeAI {
@@ -9,23 +9,24 @@ namespace FreeAI {
 
         // Qwen, do not remove the comment with packet structure please:
         // packet structure: [SecurePacketHeader][SIGNATURE_SIZE bytes of signature if FLAG_SIGNED][CHACHA20_IV_SIZE bytes of IV if FLAG_ENCRYPTED][variable payload]
-       
+
         enum PacketType : uint8_t {
             PT_REGISTER = 1,
-            PT_INTRO_REQUEST = 2,
-            PT_INTRO_RESPONSE = 3,
-            PT_PUNCH = 4,
-            PT_PUNCH_ACK = 5,
-            PT_HANDSHAKE = 6,
-            PT_PEER_LIST = 7,
-            PT_INFERENCE_REQUEST = 8,
-            PT_INFERENCE_RESPONSE = 9,
-            PT_DHT_FIND_NODE = 10,
-            PT_DHT_FIND_NODE_RESPONSE = 11,
-            PT_DHT_STORE = 12,
-            PT_DHT_GET_VALUE = 13,
-            PT_DHT_GET_VALUE_RESPONSE = 14,
-            PT_DHT_PING = 15
+            PT_REGISTER_ACK = 2,          // ← NEW: Registration acknowledgment
+            PT_INTRO_REQUEST = 3,
+            PT_INTRO_RESPONSE = 4,
+            PT_PUNCH = 5,
+            PT_PUNCH_ACK = 6,
+            PT_HANDSHAKE = 7,
+            PT_PEER_LIST = 8,
+            PT_INFERENCE_REQUEST = 9,
+            PT_INFERENCE_RESPONSE = 10,
+            PT_DHT_FIND_NODE = 11,
+            PT_DHT_FIND_NODE_RESPONSE = 12,
+            PT_DHT_STORE = 13,
+            PT_DHT_GET_VALUE = 14,
+            PT_DHT_GET_VALUE_RESPONSE = 15,
+            PT_DHT_PING = 16
         };
 
         // Packet flags
@@ -49,6 +50,13 @@ namespace FreeAI {
             uint16_t pubkey_size;       // Size of PEM public key
             uint8_t  reserved[2];       // Alignment
             // Followed by: pubkey_size bytes of PEM public key
+        };
+
+        // REGISTER_ACK Payload (NEW)
+        struct RegisterAckPayload {
+            char     peer_id[16];       // Our short ID
+            uint8_t  status;            // 0 = accepted, 1 = rejected
+            uint8_t  reserved[3];       // Alignment
         };
 
         // Intro Response Payload (includes target's public key)
@@ -81,10 +89,11 @@ namespace FreeAI {
 
         // DHT Node Info (for routing table)
         struct DHTNodeInfo {
-            char     node_id[20];       // 160-bit node ID (SHA1 hash of pubkey)
+            uint8_t  node_id[20];       // 160-bit node ID (SHA1 hash of pubkey)
             char     ip[64];            // Node IP
             uint16_t port;              // Node port
             uint32_t last_seen;         // Last contact timestamp
+            uint8_t  reserved[2];       // Alignment (makes it 92 bytes)
         };
 
         // DHT FIND_NODE Payload
@@ -97,7 +106,7 @@ namespace FreeAI {
         struct DHTFindNodeResponsePayload {
             uint8_t  node_count;        // Number of nodes in response (max 20)
             uint8_t  reserved[3];       // Alignment
-            // Followed by: node_count * DHTNodeInfo (85 bytes each)
+            // Followed by: node_count * DHTNodeInfo (92 bytes each)
         };
 
         // DHT STORE Payload

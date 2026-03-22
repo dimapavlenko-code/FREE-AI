@@ -15,6 +15,15 @@
 namespace FreeAI {
     namespace Network {
 
+        // NEW: Connection state machine for robust registration
+        enum class PeerConnectionState {
+            Disconnected,      // Never attempted
+            Connecting,        // REGISTER sent, awaiting ACK
+            Connected,         // REGISTER_ACK received
+            Verified,          // Signature verified, fully trusted
+            Failed             // Multiple failures, in backoff
+        };
+
         struct PeerInfo {
             std::string ip;
             int port;
@@ -22,7 +31,19 @@ namespace FreeAI {
             std::string public_key_pem;
             int64_t last_seen;
             bool is_super_node;
-            bool is_direct;  // NEW: Can we connect directly (hole punch successful)?
+            bool is_direct;  // Can we connect directly (hole punch successful)?
+        };
+
+        struct SeedRegistration {
+            std::string ip;
+            int port;
+            std::string seed_address;  // "ip:port" for lookup
+            uint32_t first_attempt_ts;
+            uint32_t last_attempt_ts;
+            uint32_t last_success_ts;          // NEW: Last successful communication
+            PeerConnectionState state;         // NEW: State machine
+            int retry_count;
+            int next_retry_delay_sec;          // NEW: Exponential backoff
         };
 
         class PeerManager {
@@ -45,14 +66,19 @@ namespace FreeAI {
             HolePunchManager m_punchManager;
             std::thread m_punchThread;
 
-            // Store peer public keys for signature verification
-            mutable std::mutex m_keyMutex;
+            // Store peer public keys for signature verification         
             std::unordered_map<std::string, std::string> m_peerPublicKeys;  // peer_id → PEM
 
             DHT m_dht;  // DHT engine
 
+            // Track seed registration state            
+            std::thread m_seedThread;
+            std::vector<SeedRegistration> m_seedRegistrations;
+
+            mutable std::mutex m_networkMutex;  // Single mutex for seeds + keys
+
         public:
-            
+
             PeerManager();
             ~PeerManager();
 
@@ -85,7 +111,7 @@ namespace FreeAI {
             // Hole punching methods
             void RequestIntroduction(const std::string& ip, int port, const std::string& target_peer_id);
             void SendPunchPacket(const std::string& ip, int port, const std::string& peer_id);
-            void HandlePunchPacket(const std::string& ip, int port, const PunchPayload* payload);    
+            void HandlePunchPacket(const std::string& ip, int port, const PunchPayload* payload);
 
             // Key exchange methods
             void StorePeerPublicKey(const std::string& peer_id, const std::string& pem);
@@ -100,7 +126,10 @@ namespace FreeAI {
             void ListenLoop();
             void HandleBootstrapPacket(UDPSocket& sock, char* buffer, int bytes, const std::string& ip, int port);
             void ConnectToSeeds();
-            void RequestPeerList(const std::string& ip, int port);
+
+            void SendInitialRegistrations();
+            void SendRegistration(SeedRegistration& reg);
+            void SeedRegistrationLoop();
 
             // DHT methods
             void ProcessDHTPacket(UDPSocket& sock, const std::string& ip, int port,
@@ -109,7 +138,7 @@ namespace FreeAI {
                 const DHTFindNodePayload* payload);
             void HandleDHTFindNodeResponse(const std::string& ip, int port,
                 const DHTFindNodeResponsePayload* payload);
-            
+
         };
 
     }

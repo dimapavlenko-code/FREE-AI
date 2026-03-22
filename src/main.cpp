@@ -4,6 +4,11 @@
 #include "utils/Config.hpp"
 #include "crypto/Identity.hpp"
 
+#include <Windows.h>
+#include <lmcons.h>
+#include <conio.h>
+#pragma comment(lib, "advapi32.lib")
+
 #define PROJECT_NAME "FREE-AI"
 #define PROJECT_VERSION "0.1.0"
 
@@ -50,11 +55,21 @@ int main() {
     peerManager.SetSigningEnabled(config.GetBool("security", "enable_signing", true));  // NEW
     peerManager.Start();
 
-    std::cout << "[MAIN] Running... Press Enter to stop." << std::endl;
-    // ToDo: In main loop, add periodic DHT stats:
-    std::cout << "[DHT] Known nodes: " << peerManager.GetDHTNodeCount() << std::endl;
+    std::cout << "[MAIN] Running... Press x to stop." << std::endl;
 
-    std::cin.get();
+    // for Qwen: this is windows-specific, but needed only for debugging, so do not worry
+    while (true) {
+        if (_kbhit() && _getch() == 'x')
+            break;
+        static size_t prevnodecnt(0);
+        auto curnodecnt = peerManager.GetDHTNodeCount();
+        if (curnodecnt != prevnodecnt) {
+            prevnodecnt = curnodecnt;
+            std::cout << "[DHT] Known nodes: " << curnodecnt << std::endl;
+        }
+
+        Sleep(500);
+    }
 
     // 5. Cleanup
     peerManager.Stop();

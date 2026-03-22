@@ -2,11 +2,13 @@
 #include "network/Protocol.hpp"
 #include "network/PacketSecurity.hpp"
 #include "utils/ThreadUtils.hpp"
+#include <mbedtls/sha1.h>
 #include <iostream>
 #include <sstream>
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 
 namespace FreeAI {
     namespace Network {
@@ -60,7 +62,12 @@ namespace FreeAI {
         void PeerManager::Start() {
             m_running = true;
 
-            // Try to bind - determines if we are Super Node
+            // CRITICAL: Ensure identity is loaded BEFORE starting threads
+            if (!m_identity || !m_identity->IsValid()) {
+                std::cerr << "[PEER] FATAL: Identity not loaded before Start()!" << std::endl;
+                return;
+            }
+
             if (!m_socket.Create()) {
                 std::cerr << "[PEER] Failed to create UDP socket." << std::endl;
                 return;
@@ -76,26 +83,25 @@ namespace FreeAI {
                 std::cout << "[PEER] Running as Leaf Node (NAT detected)." << std::endl;
             }
 
-            // DHT initialization:
+            // DHT initialization
             m_dht.Initialize(m_identity);
             m_dht.Start(&m_socket);
 
+            // Start all background threads
             m_listenerThread = std::thread(&PeerManager::ListenLoop, this);
             m_punchThread = std::thread(&PeerManager::PunchLoop, this);
+            m_seedThread = std::thread(&PeerManager::SeedRegistrationLoop, this);
 
-            // Connect to seeds in background
+            // Start registration (non-blocking)
             std::thread(&PeerManager::ConnectToSeeds, this).detach();
         }
 
         void PeerManager::Stop() {
             m_running = false;
-            if (m_listenerThread.joinable()) {
-                m_listenerThread.join();
-            }
-            
-            if (m_punchThread.joinable()) {
-                m_punchThread.join();
-            }
+
+            if (m_listenerThread.joinable()) m_listenerThread.join();
+            if (m_punchThread.joinable()) m_punchThread.join();
+            if (m_seedThread.joinable()) m_seedThread.join();
 
             m_socket.Close();
         }
@@ -109,6 +115,7 @@ namespace FreeAI {
 
             switch (type) {
             case PT_REGISTER:
+            case PT_REGISTER_ACK:
             case PT_HANDSHAKE:
             case PT_PEER_LIST:
             case PT_INFERENCE_REQUEST:
@@ -140,17 +147,17 @@ namespace FreeAI {
         }
 
         void PeerManager::ListenLoop() {
-            // Set this thread to low priority
             FreeAI::Utils::SetThreadPriorityLow();
 
-            char buffer[MAX_PACKET_SIZE];
+            std::vector<char> buffer(MAX_PACKET_SIZE);
+            auto pbuf = buffer.data();
             std::string sender_ip;
             int sender_port;
 
             while (m_running) {
-                int bytes = m_socket.ReceiveFrom(buffer, sizeof(buffer), sender_ip, sender_port);
+                int bytes = m_socket.ReceiveFrom(pbuf, MAX_PACKET_SIZE, sender_ip, sender_port);
                 if (bytes > 0) {
-                    HandleBootstrapPacket(m_socket, buffer, bytes, sender_ip, sender_port);
+                    HandleBootstrapPacket(m_socket, pbuf, bytes, sender_ip, sender_port);
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -182,31 +189,94 @@ namespace FreeAI {
 
             // Handle Packet Types
             if (header.type == PT_REGISTER && m_isSuperNode) {
-                // RegisterPayload: [peer_id:16][pubkey_size:2][reserved:2][pubkey:variable]
                 if (payload.size() >= sizeof(RegisterPayload)) {
                     const RegisterPayload* reg = reinterpret_cast<const RegisterPayload*>(payload.data());
 
-                    // Read peer_id from struct (first 16 bytes)
                     std::string peer_id = std::string(reg->peer_id);
-
-                    // Read pubkey after the struct
                     const uint8_t* pubkey_data = payload.data() + sizeof(RegisterPayload);
                     std::string pubkey_pem = std::string(
                         reinterpret_cast<const char*>(pubkey_data),
                         reg->pubkey_size);
 
-                    std::cout << "[PEER] Registered: " << peer_id << " @ " << ip << ":" << port << std::endl;
-                    std::cout << "[PEER] Public Key Size: " << reg->pubkey_size << " bytes" << std::endl;
+                    // NEW: Check if already registered (prevent duplicates)
+                    {
+                        std::lock_guard<std::mutex> lock(m_networkMutex);
+                        if (m_peerPublicKeys.count(peer_id) > 0) {
+                            std::cout << "[PEER] Peer already registered: " << peer_id << std::endl;
+                            return;  // Skip duplicate processing
+                        }
+                    }
 
-                    // Store public key under the SHORT ID (not the PEM!)
+                    std::cout << "[PEER] Registered: " << peer_id << " @ " << ip << ":" << port << std::endl;
+
+                    // Store public key
                     StorePeerPublicKey(peer_id, pubkey_pem);
                     AddPeer({ ip, port, peer_id, pubkey_pem, std::time(nullptr), true, false });
 
-                    std::cout << "[DEBUG] Payload size: " << payload.size() << std::endl;
-                    std::cout << "[DEBUG] RegisterPayload size: " << sizeof(RegisterPayload) << std::endl;
-                    std::cout << "[DEBUG] Peer ID (raw): " << std::string(reg->peer_id, 16) << std::endl;
-                    std::cout << "[DEBUG] Peer ID (trimmed): " << peer_id << std::endl;
-                    std::cout << "[DEBUG] PubKey size: " << reg->pubkey_size << std::endl;
+                    // Add to DHT routing table (SHA1 of pubkey = DHT node ID)
+                    uint8_t dht_node_id[20];
+                    mbedtls_sha1_context ctx;
+                    mbedtls_sha1_init(&ctx);
+                    mbedtls_sha1_starts(&ctx);
+                    mbedtls_sha1_update(&ctx,
+                        reinterpret_cast<const unsigned char*>(pubkey_pem.c_str()),
+                        pubkey_pem.size());
+                    mbedtls_sha1_finish(&ctx, dht_node_id);
+                    mbedtls_sha1_free(&ctx);
+
+                    m_dht.AddNode(dht_node_id, ip, port);
+                    std::cout << "[DHT] Added peer to routing table: " << peer_id << std::endl;
+
+                    // Send peer list to newly registered node
+                    std::string peerList = BuildPeerList();
+                    if (!peerList.empty()) {
+                        SendSecurePacket(sock, ip, port, PT_PEER_LIST,
+                            peerList.c_str(), peerList.size());
+                    }
+
+                    // Send REGISTER_ACK (NEW)
+                    RegisterAckPayload ack;
+                    std::memset(&ack, 0, sizeof(ack));
+                    strncpy(ack.peer_id, m_identity->GetShortID().c_str(), sizeof(ack.peer_id) - 1);
+                    ack.status = 0;  // Accepted
+
+                    SendSecurePacket(sock, ip, port, PT_REGISTER_ACK, &ack, sizeof(ack));
+
+                    // Mark this seed as registered (they know about us now)
+                    {
+                        std::lock_guard<std::mutex> lock(m_networkMutex);
+                        for (auto& sreg : m_seedRegistrations) {
+                            if (sreg.ip == ip && sreg.port == port) {
+                                sreg.state = PeerConnectionState::Connected;
+                                sreg.last_success_ts = static_cast<uint32_t>(std::time(nullptr));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (header.type == PT_REGISTER_ACK) {
+                // NEW: Handle registration acknowledgment
+                if (payload.size() >= sizeof(RegisterAckPayload)) {
+                    const RegisterAckPayload* ack = reinterpret_cast<const RegisterAckPayload*>(payload.data());
+
+                    {
+                        std::lock_guard<std::mutex> lock(m_networkMutex);
+                        for (auto& reg : m_seedRegistrations) {
+                            if (reg.ip == ip && reg.port == port) {
+                                if (ack->status == 0) {
+                                    reg.state = PeerConnectionState::Connected;
+                                    reg.last_success_ts = static_cast<uint32_t>(std::time(nullptr));
+                                    std::cout << "[PEER] Registration ACK received from " << ip << ":" << port << std::endl;
+                                }
+                                else {
+                                    reg.state = PeerConnectionState::Failed;
+                                    std::cerr << "[PEER] Registration rejected by " << ip << ":" << port << std::endl;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             else if (header.type == PT_INTRO_REQUEST && m_isSuperNode) {
@@ -259,10 +329,32 @@ namespace FreeAI {
                 auto newPeers = ParsePeerList(
                     reinterpret_cast<const char*>(payload.data()),
                     payload.size());
+
                 for (const auto& p : newPeers) {
+                    // Skip self
+                    if (p.ip == "127.0.0.1" && p.port == m_listenPort) {
+                        continue;
+                    }
+
                     AddPeer(p);
+
+                    // Also add to DHT routing table
+                    if (!p.public_key_pem.empty()) {
+                        uint8_t dht_node_id[20];
+                        mbedtls_sha1_context ctx;
+                        mbedtls_sha1_init(&ctx);
+                        mbedtls_sha1_starts(&ctx);
+                        mbedtls_sha1_update(&ctx,
+                            reinterpret_cast<const unsigned char*>(p.public_key_pem.c_str()),
+                            p.public_key_pem.size());
+                        mbedtls_sha1_finish(&ctx, dht_node_id);
+                        mbedtls_sha1_free(&ctx);
+
+                        m_dht.AddNode(dht_node_id, p.ip, p.port);
+                    }
                 }
                 std::cout << "[PEER] Received " << newPeers.size() << " peers from seed." << std::endl;
+                std::cout << "[DHT] Routing table has " << m_dht.GetNodeCount() << " nodes" << std::endl;
             }
             else if (header.type == PT_PUNCH) {
                 if (payload.size() >= sizeof(PunchPayload)) {
@@ -274,7 +366,7 @@ namespace FreeAI {
                 std::cout << "[PUNCH] Received punch ACK from " << ip << ":" << port << std::endl;
                 if (payload.size() >= sizeof(PunchPayload)) {
                     const PunchPayload* punch = reinterpret_cast<const PunchPayload*>(payload.data());
-                    m_punchManager.MarkSuccess(punch->sender_id);  // ✅ Fixed: use actual sender_id
+                    m_punchManager.MarkSuccess(punch->sender_id);
                 }
             }
             else if (header.type >= PT_DHT_FIND_NODE && header.type <= PT_DHT_PING) {
@@ -300,7 +392,6 @@ namespace FreeAI {
                 HandleDHTFindNodeResponse(ip, port, findResp);
             }
             else if (type == PT_DHT_PING) {
-                // Respond with pong (same packet type for simplicity)
                 m_dht.SendDHTPacket(&m_socket, ip, port, PT_DHT_PING, nullptr, 0);
                 m_dht.ProcessIncoming(payload.data(), payload.size(), ip, port);
             }
@@ -310,17 +401,12 @@ namespace FreeAI {
             const DHTFindNodePayload* payload) {
             std::cout << "[DHT] FIND_NODE request from " << ip << ":" << port << std::endl;
 
-            // Find closest nodes to target
             auto closestNodes = m_dht.FindNodes(
                 reinterpret_cast<const uint8_t*>(payload->target_id));
 
-            // Build response
             DHTFindNodeResponsePayload response;
+            memset(&response, 0, sizeof(response));
             response.node_count = static_cast<uint8_t>(std::min(closestNodes.size(), size_t(20)));
-            response.reserved[0] = 0;
-            response.reserved[1] = 0;
-            response.reserved[2] = 0;
-            response.reserved[3] = 0;
 
             std::vector<uint8_t> responsePacket;
             responsePacket.resize(sizeof(DHTFindNodeResponsePayload) +
@@ -330,14 +416,20 @@ namespace FreeAI {
 
             for (size_t i = 0; i < closestNodes.size() && i < 20; ++i) {
                 DHTNodeInfo nodeInfo;
+                memset(&nodeInfo, 0, sizeof(nodeInfo));
+
                 memcpy(nodeInfo.node_id, closestNodes[i].node_id, DHT_NODE_ID_SIZE);
                 strncpy(nodeInfo.ip, closestNodes[i].ip.c_str(), sizeof(nodeInfo.ip) - 1);
+                nodeInfo.ip[sizeof(nodeInfo.ip) - 1] = '\0';
                 nodeInfo.port = static_cast<uint16_t>(closestNodes[i].port);
                 nodeInfo.last_seen = closestNodes[i].last_seen;
 
                 memcpy(responsePacket.data() + sizeof(DHTFindNodeResponsePayload) +
                     i * sizeof(DHTNodeInfo), &nodeInfo, sizeof(DHTNodeInfo));
             }
+
+            std::cout << "[DEBUG] Sending DHT response: " << responsePacket.size() << " bytes, "
+                << (int)response.node_count << " nodes" << std::endl;
 
             m_dht.SendDHTPacket(&m_socket, ip, port, PT_DHT_FIND_NODE_RESPONSE,
                 responsePacket.data(), responsePacket.size());
@@ -355,60 +447,206 @@ namespace FreeAI {
                 const DHTNodeInfo* nodeInfo = reinterpret_cast<const DHTNodeInfo*>(
                     ptr + i * sizeof(DHTNodeInfo));
 
-                // Add to routing table
                 m_dht.AddNode(
                     reinterpret_cast<const uint8_t*>(nodeInfo->node_id),
                     nodeInfo->ip, nodeInfo->port);
 
                 std::cout << "[DHT] Learned about node: ";
                 for (int j = 0; j < 8; ++j) {
-                    printf("%02x", nodeInfo->node_id[j]);
+                    printf("%02x", static_cast<unsigned int>(nodeInfo->node_id[j]));
                 }
                 std::cout << " @ " << nodeInfo->ip << ":" << nodeInfo->port << std::endl;
             }
         }
 
         void PeerManager::ConnectToSeeds() {
+            // Wait for system to stabilize (no hardcoded timing dependencies, just safety)
             std::this_thread::sleep_for(std::chrono::seconds(2));
 
-            for (const auto& seed : m_seedNodes) {
-                size_t pos = seed.find(':');
-                if (pos == std::string::npos) continue;
+            // Initialize registration state for all seeds
+            {
+                std::lock_guard<std::mutex> lock(m_networkMutex);
+                for (const auto& seed : m_seedNodes) {
+                    size_t pos = seed.find(':');
+                    if (pos == std::string::npos) continue;
 
-                std::string ip = seed.substr(0, pos);
-                int port = std::stoi(seed.substr(pos + 1));
+                    SeedRegistration reg;
+                    reg.seed_address = seed;
+                    reg.ip = seed.substr(0, pos);
+                    reg.port = std::stoi(seed.substr(pos + 1));
+                    reg.first_attempt_ts = 0;
+                    reg.last_attempt_ts = 0;
+                    reg.last_success_ts = 0;
+                    reg.state = PeerConnectionState::Disconnected;
+                    reg.retry_count = 0;
+                    reg.next_retry_delay_sec = 2;  // Start with 2 seconds
 
-                std::cout << "[PEER] Connecting to seed: " << ip << ":" << port << std::endl;
+                    m_seedRegistrations.push_back(reg);
+                }
+            }
 
-                // CORRECT: Use short ID (8 chars), not PEM
-                std::string peer_id = m_identity ? m_identity->GetShortID() : "unknown";
-                std::string pubkey_pem = m_identity ? m_identity->GetPublicKeyPEM() : "";
+            // Send initial REGISTER to all seeds (no blocking wait)
+            SendInitialRegistrations();
+        }
 
-                RegisterPayload regPayload;
-                std::memset(&regPayload, 0, sizeof(regPayload));
+        void PeerManager::SendInitialRegistrations() {
+            std::lock_guard<std::mutex> lock(m_networkMutex);
 
-                // Ensure null-termination
-                strncpy(regPayload.peer_id, peer_id.c_str(), sizeof(regPayload.peer_id) - 1);
-                regPayload.peer_id[sizeof(regPayload.peer_id) - 1] = '\0';
-
-                regPayload.pubkey_size = static_cast<uint16_t>(pubkey_pem.size());
-
-                // Build packet: [RegisterPayload][pubkey_pem]
-                std::vector<uint8_t> regPacket;
-                regPacket.resize(sizeof(RegisterPayload) + pubkey_pem.size());
-                std::memcpy(regPacket.data(), &regPayload, sizeof(RegisterPayload));
-                std::memcpy(regPacket.data() + sizeof(RegisterPayload),
-                    pubkey_pem.c_str(), pubkey_pem.size());
-
-                SendSecurePacket(m_socket, ip, port, PT_REGISTER,
-                    regPacket.data(), regPacket.size());
-
-                SendSecurePacket(m_socket, ip, port, PT_PEER_LIST, nullptr, 0);
+            for (auto& reg : m_seedRegistrations) {
+                if (reg.state == PeerConnectionState::Disconnected) {
+                    SendRegistration(reg);
+                    reg.state = PeerConnectionState::Connecting;
+                    reg.first_attempt_ts = static_cast<uint32_t>(std::time(nullptr));
+                    reg.last_attempt_ts = reg.first_attempt_ts;
+                }
             }
         }
 
-        void PeerManager::RequestPeerList(const std::string& ip, int port) {
-            SendSecurePacket(m_socket, ip, port, PT_PEER_LIST, nullptr, 0);
+        void PeerManager::SendRegistration(SeedRegistration& reg) {
+            // NOTE: Called while m_networkMutex is already held!
+            // Do NOT acquire any locks here
+
+            // CRITICAL: Verify identity is ready before sending
+            if (!m_identity || !m_identity->IsValid()) {
+                std::cerr << "[PEER] Cannot register: identity not valid!" << std::endl;
+                return;
+            }
+
+            std::string peer_id = m_identity->GetShortID();
+            std::string pubkey_pem = m_identity->GetPublicKeyPEM();
+
+            RegisterPayload regPayload;
+            std::memset(&regPayload, 0, sizeof(regPayload));
+
+            strncpy(regPayload.peer_id, peer_id.c_str(), sizeof(regPayload.peer_id) - 1);
+            regPayload.peer_id[sizeof(regPayload.peer_id) - 1] = '\0';
+            regPayload.pubkey_size = static_cast<uint16_t>(pubkey_pem.size());
+
+            std::vector<uint8_t> regPacket;
+            regPacket.resize(sizeof(RegisterPayload) + pubkey_pem.size());
+            std::memcpy(regPacket.data(), &regPayload, sizeof(RegisterPayload));
+            std::memcpy(regPacket.data() + sizeof(RegisterPayload),
+                pubkey_pem.c_str(), pubkey_pem.size());
+
+            SendSecurePacket(m_socket, reg.ip, reg.port, PT_REGISTER,
+                regPacket.data(), regPacket.size());
+
+            reg.last_attempt_ts = static_cast<uint32_t>(std::time(nullptr));
+            reg.retry_count++;
+
+            std::cout << "[PEER] Sent REGISTER to " << reg.ip << ":" << reg.port
+                << " (attempt " << reg.retry_count << ", delay " << reg.next_retry_delay_sec << "s)" << std::endl;
+        }
+
+        void PeerManager::SeedRegistrationLoop() {
+            FreeAI::Utils::SetThreadPriorityLow();
+
+            while (m_running) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+                uint32_t curTs = static_cast<uint32_t>(std::time(nullptr));
+                bool allVerified = true;
+
+                std::lock_guard<std::mutex> lock(m_networkMutex);
+
+                for (auto& reg : m_seedRegistrations) {
+                    // Skip if already verified
+                    if (reg.state == PeerConnectionState::Verified) {
+                        continue;
+                    }
+
+                    // Check if identity is ready before attempting
+                    if (!m_identity || !m_identity->IsValid()) {
+                        allVerified = false;
+                        continue;
+                    }
+
+                    // State machine handling
+                    switch (reg.state) {
+                    case PeerConnectionState::Disconnected:
+                        // First attempt - send REGISTER
+                        SendRegistration(reg);
+                        reg.state = PeerConnectionState::Connecting;
+                        reg.retry_count = 1;
+                        reg.next_retry_delay_sec = 2;  // Start with 2 seconds
+                        allVerified = false;
+                        break;
+
+                    case PeerConnectionState::Connecting:
+                        // Check for timeout (no ACK received)
+                        if (curTs > reg.last_attempt_ts + static_cast<uint32_t>(reg.next_retry_delay_sec)) {
+                            // Exponential backoff with max 60 seconds
+                            reg.next_retry_delay_sec = std::min(reg.next_retry_delay_sec * 2, 60);
+                            reg.retry_count++;
+
+                            if (reg.retry_count <= 10) {  // More retries for resilience
+                                SendRegistration(reg);
+                                std::cout << "[PEER] Retrying registration with " << reg.ip
+                                    << ":" << reg.port << " (attempt " << reg.retry_count
+                                    << ", delay " << reg.next_retry_delay_sec << "s)" << std::endl;
+                            }
+                            else {
+                                reg.state = PeerConnectionState::Failed;
+                                std::cerr << "[PEER] Registration failed with " << reg.ip
+                                    << ":" << reg.port << " after " << reg.retry_count << " attempts" << std::endl;
+                            }
+                        }
+                        allVerified = false;
+                        break;
+
+                    case PeerConnectionState::Connected:
+                        // REGISTER_ACK received, verify signature by checking public key
+                        if (m_peerPublicKeys.count(reg.seed_address) > 0 ||
+                            m_peerPublicKeys.count(reg.ip + ":" + std::to_string(reg.port)) > 0) {
+                            reg.state = PeerConnectionState::Verified;
+                            reg.last_success_ts = curTs;
+                            std::cout << "[PEER] Connection verified with " << reg.ip << ":" << reg.port << std::endl;
+                        }
+                        else {
+                            allVerified = false;
+                        }
+                        break;
+
+                    case PeerConnectionState::Failed:
+                        // Periodic recovery attempt (every 5 minutes)
+                        if (curTs > reg.last_attempt_ts + 300) {
+                            reg.state = PeerConnectionState::Disconnected;
+                            reg.retry_count = 0;
+                            reg.next_retry_delay_sec = 2;
+                            std::cout << "[PEER] Recovering failed connection to " << reg.ip << ":" << reg.port << std::endl;
+                        }
+                        allVerified = false;
+                        break;
+
+                    case PeerConnectionState::Verified:
+                        // Already verified
+                        break;
+                    }
+                }
+
+                // Trigger DHT discovery when ALL seeds are verified
+                static bool dhtDiscoverySent = false;
+                if (!dhtDiscoverySent && allVerified && !m_seedRegistrations.empty()) {
+                    dhtDiscoverySent = true;
+
+                    // Inline DHT discovery - no second lock!
+                    uint8_t random_target[20];
+                    memset(random_target, 0, 20);
+
+                    for (const auto& reg : m_seedRegistrations) {
+                        DHTFindNodePayload findPayload;
+                        memset(&findPayload, 0, sizeof(findPayload));
+                        memcpy(findPayload.target_id, random_target, 20);
+
+                        m_dht.SendDHTPacket(&m_socket, reg.ip, reg.port, PT_DHT_FIND_NODE,
+                            &findPayload, sizeof(findPayload));
+
+                        std::cout << "[DHT] Sent FIND_NODE to " << reg.ip << ":" << reg.port << std::endl;
+                    }
+
+                    std::cout << "[DHT] Final routing table has " << m_dht.GetNodeCount() << " nodes" << std::endl;
+                }
+            }
         }
 
         std::vector<PeerInfo> PeerManager::ParsePeerList(const char* data, size_t size) {
@@ -422,11 +660,22 @@ namespace FreeAI {
             while (std::getline(ss, line, ';')) {
                 size_t pos1 = line.find(':');
                 size_t pos2 = line.find(':', pos1 + 1);
+                size_t pos3 = line.find(':', pos2 + 1);
+
                 if (pos1 != std::string::npos && pos2 != std::string::npos) {
                     PeerInfo p;
                     p.ip = line.substr(0, pos1);
                     p.port = std::stoi(line.substr(pos1 + 1, pos2 - pos1 - 1));
-                    p.peer_id = line.substr(pos2 + 1);
+
+                    if (pos3 != std::string::npos) {
+                        p.peer_id = line.substr(pos2 + 1, pos3 - pos2 - 1);
+                        p.public_key_pem = line.substr(pos3 + 1);
+                    }
+                    else {
+                        p.peer_id = line.substr(pos2 + 1);
+                        p.public_key_pem = "";
+                    }
+
                     p.last_seen = std::time(nullptr);
                     p.is_super_node = true;
                     peers.push_back(p);
@@ -438,16 +687,16 @@ namespace FreeAI {
         std::string PeerManager::BuildPeerList() {
             std::stringstream ss;
             auto peers = GetKnownPeers();
-            for (size_t i = 0; i < peers.size() && i < 10; ++i) { // Limit to 10 peers
+            for (size_t i = 0; i < peers.size() && i < 10; ++i) {
                 if (i > 0) ss << ";";
-                ss << peers[i].ip << ":" << peers[i].port << ":" << peers[i].peer_id;
+                ss << peers[i].ip << ":" << peers[i].port << ":"
+                    << peers[i].peer_id << ":" << peers[i].public_key_pem;
             }
             return ss.str();
         }
 
         void PeerManager::AddPeer(const PeerInfo& peer) {
             std::lock_guard<std::mutex> lock(m_peerMutex);
-            // Check if already exists
             for (const auto& p : m_peers) {
                 if (p.ip == peer.ip && p.port == peer.port) {
                     return;
@@ -465,8 +714,6 @@ namespace FreeAI {
             return m_isSuperNode;
         }
 
-
-        // PunchLoop - Background thread for punch attempts
         void PeerManager::PunchLoop() {
             FreeAI::Utils::SetThreadPriorityLow();
 
@@ -485,14 +732,12 @@ namespace FreeAI {
             }
         }
 
-        // RequestIntroduction - Ask Super Node to introduce us to a peer
         void PeerManager::RequestIntroduction(const std::string& ip, int port, const std::string& target_peer_id) {
             std::cout << "[PEER] Requesting introduction to " << target_peer_id << std::endl;
             SendSecurePacket(m_socket, ip, port, PT_INTRO_REQUEST,
                 target_peer_id.c_str(), target_peer_id.size());
         }
 
-        // SendPunchPacket - Send a hole punch attempt
         void PeerManager::SendPunchPacket(const std::string& ip, int port, const std::string& peer_id) {
             PunchPayload payload;
             std::memset(&payload, 0, sizeof(payload));
@@ -500,26 +745,21 @@ namespace FreeAI {
             std::string short_id = m_identity ? m_identity->GetShortID() : "unknown";
             std::strncpy(payload.sender_id, short_id.c_str(), sizeof(payload.sender_id) - 1);
             payload.timestamp = std::time(nullptr);
-            payload.attempt_num = 1; // Will be updated by PunchManager
+            payload.attempt_num = 1;
 
             std::cout << "[PUNCH] Sending punch to " << ip << ":" << port << std::endl;
             SendSecurePacket(m_socket, ip, port, PT_PUNCH, &payload, sizeof(payload));
         }
 
-        // HandlePunchPacket - Process incoming punch
         void PeerManager::HandlePunchPacket(const std::string& ip, int port, const PunchPayload* payload) {
             std::cout << "[PUNCH] Received punch from " << payload->sender_id
                 << " @ " << ip << ":" << port << std::endl;
 
-            // Send acknowledgment
             SendSecurePacket(m_socket, ip, port, PT_PUNCH_ACK, payload, sizeof(PunchPayload));
 
-            // Mark as direct connection available
             auto peers = GetKnownPeers();
             for (const auto& peer : peers) {
                 if (peer.peer_id == payload->sender_id) {
-                    // Update peer to mark as direct
-                    // (Would need a UpdatePeer method)
                     break;
                 }
             }
@@ -527,16 +767,14 @@ namespace FreeAI {
             m_punchManager.MarkSuccess(payload->sender_id);
         }
 
-        // Store peer public key
         void PeerManager::StorePeerPublicKey(const std::string& peer_id, const std::string& pem) {
-            std::lock_guard<std::mutex> lock(m_keyMutex);
+            std::lock_guard<std::mutex> lock(m_networkMutex);
             m_peerPublicKeys[peer_id] = pem;
             std::cout << "[KEYS] Stored public key for peer: " << peer_id << std::endl;
         }
 
-        // Get peer public key
         std::string PeerManager::GetPeerPublicKey(const std::string& peer_id) const {
-            std::lock_guard<std::mutex> lock(m_keyMutex);
+            std::lock_guard<std::mutex> lock(m_networkMutex);
             auto it = m_peerPublicKeys.find(peer_id);
             if (it != m_peerPublicKeys.end()) {
                 return it->second;

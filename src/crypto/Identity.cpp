@@ -1,4 +1,5 @@
 #include "crypto/Identity.hpp"
+#include "network/Protocol.hpp"
 #include <mbedtls/pk.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/entropy.h>
@@ -190,13 +191,21 @@ namespace FreeAI {
         bool Identity::Verify(const void* data, size_t length,
             const std::string& signatureB64,
             const std::string& pubKeyPEM) {
+           
             // Decode Base64
-            unsigned char sig[72];
+            unsigned char sig[Network::SIGNATURE_SIZE];
             size_t sig_len = 0;
             int ret = mbedtls_base64_decode(sig, sizeof(sig), &sig_len,
                 reinterpret_cast<const unsigned char*>(signatureB64.c_str()),
                 signatureB64.size());
-            if (ret != 0) return false;
+
+            if (ret != 0) {
+                char error_buf[100];
+                mbedtls_strerror(ret, error_buf, sizeof(error_buf));
+                std::cerr << "[ERROR] Base64 decode failed: " << error_buf
+                    << " (code: " << ret << ")" << std::endl;
+                return false;
+            }           
 
             // Parse public key
             mbedtls_pk_context pk;

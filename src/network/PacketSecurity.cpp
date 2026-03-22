@@ -3,6 +3,7 @@
 #include <random>
 #include <iostream>
 
+#include <mbedtls/mbedtls_config.h>
 #ifdef MBEDTLS_CHACHA20_C
 #include <mbedtls/chacha20.h>
 #endif
@@ -42,7 +43,7 @@ namespace FreeAI {
 			if (sign && identity && identity->IsValid()) {
 				header.flags |= FLAG_SIGNED;
 			}
-			if (encrypt) {
+			if (encrypt && payloadSize) { // nothing to encrypt if no payload
 				header.flags |= FLAG_ENCRYPTED;
 			}
 
@@ -61,8 +62,8 @@ namespace FreeAI {
 			std::vector<uint8_t> signData;
 			if (header.flags & FLAG_SIGNED) {
 				signData.insert(signData.end(), packet.data(), packet.data() + sizeof(SecurePacketHeader));
-				signData.insert(signData.end(), static_cast<const uint8_t*>(payload),
-					static_cast<const uint8_t*>(payload) + payloadSize);
+				if (payloadSize)
+					signData.insert(signData.end(), static_cast<const uint8_t*>(payload), static_cast<const uint8_t*>(payload) + payloadSize);
 
 				// Actually, let's put signature right after header for easier parsing             
 				std::string signature = identity->Sign(signData.data(), signData.size());
@@ -70,7 +71,7 @@ namespace FreeAI {
 					header.flags &= ~FLAG_SIGNED; // Remove flag if signing failed
 				}
 				else {
-					// Write signature at the position after header                        
+					// Write signature at the position after header                  
 					std::memset(ptr, 0, SIGNATURE_SIZE);
 					std::memcpy(ptr, signature.c_str(), signature.size());
 					ptr += SIGNATURE_SIZE;
@@ -134,6 +135,14 @@ namespace FreeAI {
 			return packet;
 		}
 
+		static std::string TrimNulls(const std::string& input) {
+			size_t firstNull = input.find('\0');
+			if (firstNull != std::string::npos) {
+				return input.substr(0, firstNull);
+			}
+			return input;
+		}
+
 		bool PacketSecurity::ProcessIncoming(
 			const uint8_t* data,
 			size_t dataSize,
@@ -170,7 +179,7 @@ namespace FreeAI {
 			std::string signatureB64;
 			if (outHeader.flags & FLAG_SIGNED) {
 				// Extract signature from packet
-				signatureB64 = std::string((const char*)ptr, SIGNATURE_SIZE);
+				signatureB64 = TrimNulls(std::string((const char*)ptr, SIGNATURE_SIZE)); // required to let the mbedtls decode base64 properly
 				ptr += SIGNATURE_SIZE;
 				offs += SIGNATURE_SIZE;
 			}
@@ -265,7 +274,7 @@ namespace FreeAI {
 				return false;
 			}
 
-			outPayload.assign((const uint8_t*)finalPayload,	(const uint8_t*)finalPayload + payloadSize);
+			outPayload.assign((const uint8_t*)finalPayload, (const uint8_t*)finalPayload + payloadSize);
 
 			return true;
 		}

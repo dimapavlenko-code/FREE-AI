@@ -1,4 +1,4 @@
-#include "network/DHT.hpp"
+﻿#include "network/DHT.hpp"
 #include "network/PacketSecurity.hpp"
 #include <cstring>
 #include <iostream>
@@ -191,7 +191,7 @@ namespace FreeAI {
 
             std::cout << "[DHT] Initialized with Node ID: ";
             for (int i = 0; i < 8; ++i) {
-                printf("%02x", m_local_node_id[i]);
+                printf("%02x", static_cast<unsigned int>(m_local_node_id[i]));  
             }
             std::cout << std::endl;
 
@@ -214,11 +214,15 @@ namespace FreeAI {
         void DHT::RefreshLoop() {
             while (m_running) {
                 // Periodic bucket refresh
-                std::this_thread::sleep_for(std::chrono::seconds(DHT_REFRESH_INTERVAL));
-                
-                // Could implement random node lookup here to refresh buckets
-                std::cout << "[DHT] Routing table has " << m_routingTable.TotalNodes() 
-                          << " nodes" << std::endl;
+                //std::this_thread::sleep_for(std::chrono::seconds(DHT_REFRESH_INTERVAL)); // Qwen, this deadlocks the application at exit, 900 seconds is very long time even for humans, so better to implement handlers in the next way
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                auto curT = (uint32_t)time(nullptr);
+                if (curT > m_lastDhtRefreshTs + 900) {
+                    m_lastDhtRefreshTs = curT;
+                    // Could implement random node lookup here to refresh buckets
+                    std::cout << "[DHT] Routing table has " << m_routingTable.TotalNodes()
+                        << " nodes" << std::endl;
+                }
             }
         }
 
@@ -270,15 +274,62 @@ namespace FreeAI {
         }
 
         void DHT::SendDHTPacket(UDPSocket* socket, const std::string& ip, int port,
-                               uint8_t type, const void* payload, size_t size) {
-            // Use PacketSecurity for encrypted/signed DHT packets
-            // Implementation would integrate with PeerManager's SendSecurePacket
+            uint8_t type, const void* payload, size_t size) {
+            if (!socket || !m_socket) {
+                return;
+            }
+
+            // DHT packets don't need encryption (public routing info)
+            // But we still sign them for authenticity
+            bool sign = (m_identity != nullptr) && m_identity->IsValid();
+            bool encrypt = false; // DHT data is public
+
+            // Use PacketSecurity for consistent packet format
+            std::vector<uint8_t> packet = PacketSecurity::PrepareOutgoing(
+                type, payload, size, sign, encrypt, m_identity);
+
+            if (!packet.empty()) {
+                socket->SendTo(packet.data(), packet.size(), ip, port);
+            }
         }
 
         void DHT::ProcessIncoming(const uint8_t* data, size_t size,
-                                 const std::string& ip, int port) {
-            // Parse DHT packet and update routing table
-            // Implementation would integrate with PeerManager's HandleBootstrapPacket
+            const std::string& ip, int port) {
+            // Parse DHT packet header
+            if (size < sizeof(SecurePacketHeader)) {
+                return;
+            }
+
+            SecurePacketHeader header;
+            std::vector<uint8_t> payload;
+
+            // Note: DHT packets may not have signature verification
+            // since we're just learning about nodes
+            if (!PacketSecurity::ProcessIncoming(data, size, header, payload, nullptr, "")) {
+                return;
+            }
+
+            if (header.type == PT_DHT_FIND_NODE_RESPONSE) {
+                if (payload.size() >= sizeof(DHTFindNodeResponsePayload)) {
+                    const DHTFindNodeResponsePayload* resp =
+                        reinterpret_cast<const DHTFindNodeResponsePayload*>(payload.data());
+
+                    const uint8_t* ptr = payload.data() + sizeof(DHTFindNodeResponsePayload);
+
+                    for (int i = 0; i < resp->node_count; ++i) {
+                        const DHTNodeInfo* nodeInfo = reinterpret_cast<const DHTNodeInfo*>(
+                            ptr + i * sizeof(DHTNodeInfo));
+
+                        AddNode((const uint8_t*)nodeInfo->node_id, nodeInfo->ip, nodeInfo->port);
+
+                        std::cout << "[DHT] Learned about node: ";
+                        for (int j = 0; j < 8; ++j) {
+                            printf("%02x", static_cast<unsigned int>(nodeInfo->node_id[j]));  
+                        }
+                        std::cout << " @ " << nodeInfo->ip << ":" << nodeInfo->port << std::endl;
+                    }
+                }
+            }
         }
 
     }
