@@ -3,14 +3,7 @@
 #include <cctype>
 
 namespace FreeAI {
-    namespace Utils {
-
-        std::string Config::Trim(const std::string& str) {
-            size_t start = str.find_first_not_of(" \t\r\n");
-            if (start == std::string::npos) return "";
-            size_t end = str.find_last_not_of(" \t\r\n");
-            return str.substr(start, end - start + 1);
-        }
+    namespace Utils {       
 
         ConfigSection* Config::FindSection(const std::string& name) {
             for (auto& section : m_sections) {

@@ -1,4 +1,5 @@
-#include "network/PacketSecurity.hpp"
+﻿#include "network/PacketSecurity.hpp"
+#include "utils/Helpers.hpp"
 #include <cstring>
 #include <random>
 #include <iostream>
@@ -9,275 +10,370 @@
 #endif
 
 namespace FreeAI {
-	namespace Network {
+    namespace Network {
 
-		uint32_t PacketSecurity::GenerateNonce() {
-			std::random_device rd;
-			std::mt19937 gen(rd());
-			std::uniform_int_distribution<uint32_t> dist;
-			return dist(gen);
-		}
+        // Static work memory for compression (~64KB)
+        lzo_align_t PacketSecurity::s_compressWorkMem[LZO1X_1_MEM_COMPRESS];
+        bool PacketSecurity::s_initialized = false;
 
-		void PacketSecurity::XorObfuscate(uint8_t* data, size_t size, uint32_t key) {
-			for (size_t i = 0; i < size; ++i) {
-				data[i] ^= static_cast<uint8_t>((key >> ((i % 4) * 8)) & 0xFF);
-			}
-		}
+        bool PacketSecurity::Initialize() {
+            if (s_initialized) {
+                return true;
+            }
 
-		std::vector<uint8_t> PacketSecurity::PrepareOutgoing(
-			uint8_t type,
-			const void* payload,
-			size_t payloadSize,
-			bool sign,
-			bool encrypt,
-			const Crypto::Identity* identity)
-		{
-			SecurePacketHeader header;
-			header.nonce = GenerateNonce();
-			header.magic_xor = MAGIC_NUMBER ^ header.nonce;
-			header.type = type;
-			header.flags = 0;
-			header.payload_size = static_cast<uint16_t>(payloadSize);
-			std::memset(header.reserved, 0, sizeof(header.reserved));
+            int ret = lzo_init();
+            if (ret != LZO_E_OK) {
+                std::cerr << "[COMPRESSION] lzo_init() failed: " << ret << std::endl;
+                return false;
+            }
 
-			if (sign && identity && identity->IsValid()) {
-				header.flags |= FLAG_SIGNED;
-			}
-			if (encrypt && payloadSize) { // nothing to encrypt if no payload
-				header.flags |= FLAG_ENCRYPTED;
-			}
+            s_initialized = true;
+            std::cout << "[COMPRESSION] MiniLZO initialized successfully" << std::endl;
+            return true;
+        }
 
-			// Calculate total size
-			size_t totalSize = 0;
+        void PacketSecurity::Shutdown() {
+            // MiniLZO doesn't require cleanup, but good practice
+            s_initialized = false;
+        }
 
-			std::vector<uint8_t> packet(MAX_PACKET_SIZE);
-			uint8_t* ptr = packet.data();
+        uint32_t PacketSecurity::GenerateNonce() {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint32_t> dist;
+            return dist(gen);
+        }
 
-			// Write header (XOR obfuscate the magic)
-			std::memcpy(ptr, &header, sizeof(SecurePacketHeader));
-			ptr += sizeof(SecurePacketHeader);
-			totalSize += sizeof(SecurePacketHeader);
+        void PacketSecurity::XorObfuscate(uint8_t* data, size_t size, uint32_t key) {
+            for (size_t i = 0; i < size; ++i) {
+                data[i] ^= (uint8_t)((key >> ((i % 4) * 8)) & 0xFF);
+            }
+        }
 
-			// Prepare data to sign (header + payload)
-			std::vector<uint8_t> signData;
-			if (header.flags & FLAG_SIGNED) {
-				signData.insert(signData.end(), packet.data(), packet.data() + sizeof(SecurePacketHeader));
-				if (payloadSize)
-					signData.insert(signData.end(), static_cast<const uint8_t*>(payload), static_cast<const uint8_t*>(payload) + payloadSize);
+        std::vector<uint8_t> PacketSecurity::CompressData(const uint8_t* input, size_t inputSize) {
+            if (!s_initialized) {
+                std::cerr << "[COMPRESSION] Not initialized!" << std::endl;
+                return std::vector<uint8_t>(input, input + inputSize);
+            }
 
-				// Actually, let's put signature right after header for easier parsing             
-				std::string signature = identity->Sign(signData.data(), signData.size());
-				if (signature.empty()) {
-					header.flags &= ~FLAG_SIGNED; // Remove flag if signing failed
-				}
-				else {
-					// Write signature at the position after header                  
-					std::memset(ptr, 0, SIGNATURE_SIZE);
-					std::memcpy(ptr, signature.c_str(), signature.size());
-					ptr += SIGNATURE_SIZE;
-					totalSize += SIGNATURE_SIZE;
-				}
-			}
+            // Calculate output buffer size (worst case)
+            size_t maxOutSize = inputSize + inputSize / 16 + 64 + 3;
+            std::vector<uint8_t> output(maxOutSize);
 
-			// Handle encryption
-			const void* finalPayload = payload;
-			size_t finalPayloadSize = payloadSize;
-			std::vector<uint8_t> encryptedPayload;
+            lzo_uint outLen = (lzo_uint)maxOutSize;
 
-			if (header.flags & FLAG_ENCRYPTED) {
-				// Generate IV
-				uint8_t iv[CHACHA20_IV_SIZE];
-				for (int i = 0; i < CHACHA20_IV_SIZE; ++i) {
-					iv[i] = static_cast<uint8_t>(GenerateNonce() & 0xFF);
-				}
+            int ret = lzo1x_1_compress(
+                input,
+                (lzo_uint)inputSize,
+                output.data(),
+                &outLen,
+                s_compressWorkMem
+            );
 
-				std::memcpy(ptr, iv, CHACHA20_IV_SIZE);
-				ptr += CHACHA20_IV_SIZE;
-				totalSize += CHACHA20_IV_SIZE;
+            if (ret != LZO_E_OK) {
+                std::cerr << "[COMPRESSION] Compression failed: " << ret << std::endl;
+                return std::vector<uint8_t>(input, input + inputSize);
+            }
 
-				// Encrypt (ChaCha20 if available, else XOR)
+            // If compression didn't help (incompressible data), return original
+            if (outLen >= inputSize) {
+                return std::vector<uint8_t>(input, input + inputSize);
+            }
+
+            output.resize(outLen);
+            return output;
+        }
+
+        std::vector<uint8_t> PacketSecurity::DecompressData(const uint8_t* input, size_t inputSize, size_t expectedSize) {
+            if (!s_initialized) {
+                std::cerr << "[COMPRESSION] Not initialized!" << std::endl;
+                return std::vector<uint8_t>(input, input + inputSize);
+            }
+
+            // Allocate output buffer (use expected size from header)
+            std::vector<uint8_t> output(expectedSize);
+            lzo_uint outLen = (lzo_uint)expectedSize;
+
+            int ret = lzo1x_decompress_safe(
+                input,
+                (lzo_uint)inputSize,
+                output.data(),
+                &outLen,
+                NULL  // No work memory needed for decompression
+            );
+
+            if (ret != LZO_E_OK) {
+                std::cerr << "[COMPRESSION] Decompression failed: " << ret << std::endl;
+                return std::vector<uint8_t>();
+            }
+
+            if (outLen != expectedSize) {
+                std::cerr << "[COMPRESSION] Decompressed size mismatch: "
+                    << outLen << " != " << expectedSize << std::endl;
+                return std::vector<uint8_t>();
+            }
+
+            return output;
+        }
+
+        std::vector<uint8_t> PacketSecurity::PrepareOutgoing(
+            uint8_t type,
+            const void* payload,
+            size_t payloadSize,
+            bool sign,
+            bool encrypt,
+            const Crypto::Identity* identity)
+        {
+            SecurePacketHeader header;
+            header.nonce = GenerateNonce();
+            header.magic_xor = MAGIC_NUMBER ^ header.nonce;
+            header.type = type;
+            header.flags = 0;
+            header.payload_size = (uint16_t)payloadSize;  // ← Original size!
+            memset(header.reserved, 0, sizeof(header.reserved));
+
+            if (sign && identity && identity->IsValid() && type != PT_REGISTER && (type < PT_DHT_FIND_NODE || type > PT_DHT_PING)) { //  network topology discovery types of packet may be signed, but we still not have the peer's public key) {
+                header.flags |= FLAG_SIGNED;
+            }
+
+            if (encrypt && payloadSize) {
+                header.flags |= FLAG_ENCRYPTED;
+            }
+
+            // NEW: Prepare signature data BEFORE compression (sign original payload)
+            std::vector<uint8_t> signData;
+            std::string signature;
+
+            if (header.flags & FLAG_SIGNED) {
+                // Sign header + ORIGINAL payload (before compression)
+                signData.insert(signData.end(), (uint8_t*)&header, (uint8_t*)&header + sizeof(SecurePacketHeader));
+                signData.insert(signData.end(), (const uint8_t*)payload, (const uint8_t*)payload + payloadSize);
+
+                signature = identity->Sign(signData.data(), signData.size());
+                if (signature.empty()) {
+                    header.flags &= ~FLAG_SIGNED;
+                }
+            }
+
+            // Compress payload if large enough to benefit (threshold: 100 bytes)
+            const void* finalPayload = payload;
+            size_t finalPayloadSize = payloadSize;
+            std::vector<uint8_t> compressedPayload;
+
+            if (payloadSize > 100) {
+                compressedPayload = CompressData((const uint8_t*)payload, payloadSize);
+                if (compressedPayload.size() < payloadSize) {
+                    header.flags |= FLAG_COMPRESSED;
+                    finalPayload = compressedPayload.data();
+                    finalPayloadSize = compressedPayload.size();
+                }
+            }
+
+            // Calculate total size
+            size_t totalSize = 0;
+
+            std::vector<uint8_t> packet(MAX_PACKET_SIZE);
+            uint8_t* ptr = (uint8_t*)packet.data();
+
+            // Write header
+            memcpy(ptr, &header, sizeof(SecurePacketHeader));
+            ptr += sizeof(SecurePacketHeader);
+            totalSize += sizeof(SecurePacketHeader);
+
+            // Write signature (if signed)
+            if (header.flags & FLAG_SIGNED) {
+                memset(ptr, 0, SIGNATURE_SIZE);
+                memcpy(ptr, signature.c_str(), signature.size());
+                ptr += SIGNATURE_SIZE;
+                totalSize += SIGNATURE_SIZE;
+            }
+
+            // Handle encryption
+            std::vector<uint8_t> encryptedPayload;
+
+            if (header.flags & FLAG_ENCRYPTED) {
+                // Generate IV
+                uint8_t iv[CHACHA20_IV_SIZE];
+                for (int i = 0; i < CHACHA20_IV_SIZE; ++i) {
+                    iv[i] = (uint8_t)(GenerateNonce() & 0xFF);
+                }
+
+                memcpy(ptr, iv, CHACHA20_IV_SIZE);
+                ptr += CHACHA20_IV_SIZE;
+                totalSize += CHACHA20_IV_SIZE;
+
+                // Encrypt (ChaCha20 if available, else XOR)
 #ifdef MBEDTLS_CHACHA20_C
-				mbedtls_chacha20_context ctx;
-				mbedtls_chacha20_init(&ctx);
-				uint8_t key[32]; // Should derive from handshake
-				std::memset(key, 0x42, 32); // Placeholder
-				mbedtls_chacha20_setkey(&ctx, key);
-				mbedtls_chacha20_starts(&ctx, iv, 0);
+                mbedtls_chacha20_context ctx;
+                mbedtls_chacha20_init(&ctx);
+                uint8_t key[32];
+                memset(key, 0x42, 32);
+                mbedtls_chacha20_setkey(&ctx, key);
+                mbedtls_chacha20_starts(&ctx, iv, 0);
 
-				encryptedPayload.resize(payloadSize);
-				mbedtls_chacha20_update(&ctx, payloadSize,
-					static_cast<const uint8_t*>(payload),
-					encryptedPayload.data());
-				mbedtls_chacha20_free(&ctx);
+                encryptedPayload.resize(finalPayloadSize);
+                mbedtls_chacha20_update(&ctx, finalPayloadSize,
+                    (const uint8_t*)finalPayload,
+                    encryptedPayload.data());
+                mbedtls_chacha20_free(&ctx);
 
-				finalPayload = encryptedPayload.data();
-				finalPayloadSize = encryptedPayload.size();
+                finalPayload = encryptedPayload.data();
+                finalPayloadSize = encryptedPayload.size();
 #else
-	// Fallback to XOR
-				encryptedPayload.assign(static_cast<const uint8_t*>(payload),
-					static_cast<const uint8_t*>(payload) + payloadSize);
-				XorObfuscate(encryptedPayload.data(), encryptedPayload.size(), header.nonce);
-				finalPayload = encryptedPayload.data();
-				finalPayloadSize = encryptedPayload.size();
+                encryptedPayload.assign((const uint8_t*)finalPayload,
+                    (const uint8_t*)finalPayload + finalPayloadSize);
+                XorObfuscate(encryptedPayload.data(), encryptedPayload.size(), header.nonce);
+                finalPayload = encryptedPayload.data();
+                finalPayloadSize = encryptedPayload.size();
 #endif
-			}
+            }
 
-			// Write payload			
-			std::memcpy(ptr, finalPayload, finalPayloadSize);
-			ptr += finalPayloadSize;
-			totalSize += finalPayloadSize;
+            // Write payload
+            memcpy(ptr, finalPayload, finalPayloadSize);
+            ptr += finalPayloadSize;
+            totalSize += finalPayloadSize;
 
-			packet.resize(totalSize);
+            packet.resize(totalSize);
 
-			// Final XOR obfuscation on entire packet (except magic_xor and nonce)
-			XorObfuscate(packet.data() + sizeof(uint32_t) * 2, totalSize - sizeof(uint32_t) * 2, header.nonce);
+            // Final XOR obfuscation on entire packet (except magic_xor and nonce)
+            XorObfuscate(packet.data() + sizeof(uint32_t) * 2, totalSize - sizeof(uint32_t) * 2, header.nonce);
 
-			return packet;
-		}
+            return packet;
+        }
 
-		static std::string TrimNulls(const std::string& input) {
-			size_t firstNull = input.find('\0');
-			if (firstNull != std::string::npos) {
-				return input.substr(0, firstNull);
-			}
-			return input;
-		}
+        bool PacketSecurity::ProcessIncoming(
+            const uint8_t* data,
+            size_t dataSize,
+            SecurePacketHeader& outHeader,
+            std::vector<uint8_t>& outPayload,
+            const Crypto::Identity* identity,
+            const std::string& senderPubKey)
+        {
+            if (dataSize < sizeof(SecurePacketHeader)) {
+                return false;
+            }
 
-		bool PacketSecurity::ProcessIncoming(
-			const uint8_t* data,
-			size_t dataSize,
-			SecurePacketHeader& outHeader,
-			std::vector<uint8_t>& outPayload,
-			const Crypto::Identity* identity,
-			const std::string& senderPubKey)
-		{
-			if (dataSize < sizeof(SecurePacketHeader)) {
-				return false;
-			}
+            // De-obfuscate
+            size_t offs = 0;
+            std::vector<uint8_t> packet(data, data + dataSize);
+            uint8_t* ptr = (uint8_t*)packet.data();
+            uint32_t nonce;
+            memcpy(&nonce, ptr + sizeof(uint32_t), sizeof(uint32_t));
+            XorObfuscate(ptr + sizeof(uint32_t) * 2, packet.size() - sizeof(uint32_t) * 2, nonce);
 
-			// De-obfuscate
-			size_t offs = 0;
-			std::vector<uint8_t> packet(data, data + dataSize);
-			uint8_t* ptr = packet.data();
-			uint32_t nonce;
-			std::memcpy(&nonce, ptr + sizeof(uint32_t), sizeof(uint32_t));
-			// skip magic and nonce
-			XorObfuscate(ptr + sizeof(uint32_t) * 2, packet.size() - sizeof(uint32_t) * 2, nonce);
+            // Read header
+            memcpy(&outHeader, ptr, sizeof(SecurePacketHeader));
 
-			// Read header
-			std::memcpy(&outHeader, ptr, sizeof(SecurePacketHeader));
+            ptr += sizeof(SecurePacketHeader);
+            offs += sizeof(SecurePacketHeader);
 
-			ptr += sizeof(SecurePacketHeader);
-			offs += sizeof(SecurePacketHeader);
+            // Verify magic
+            if ((outHeader.magic_xor ^ outHeader.nonce) != MAGIC_NUMBER) {
+                return false;
+            }
 
-			// Verify magic
-			if ((outHeader.magic_xor ^ outHeader.nonce) != MAGIC_NUMBER) {
-				return false; // Invalid packet
-			}
+            // Extract signature if signed
+            std::string signatureB64;
+            if (outHeader.flags & FLAG_SIGNED) {
+                signatureB64 = TrimNulls(std::string((const char*)ptr, SIGNATURE_SIZE));
+                ptr += SIGNATURE_SIZE;
+                offs += SIGNATURE_SIZE;
+            }
 
-			// extract signature if signed
-			std::string signatureB64;
-			if (outHeader.flags & FLAG_SIGNED) {
-				// Extract signature from packet
-				signatureB64 = TrimNulls(std::string((const char*)ptr, SIGNATURE_SIZE)); // required to let the mbedtls decode base64 properly
-				ptr += SIGNATURE_SIZE;
-				offs += SIGNATURE_SIZE;
-			}
+            // Handle decryption
+            const void* finalPayload = ptr;
+            size_t finalPayloadSize = dataSize - offs;
+            std::vector<uint8_t> decryptedPayload;
 
-			// Handle decryption
-			const void* finalPayload = ptr;
-			size_t finalPayloadSize = dataSize - offs;
-			std::vector<uint8_t> decryptedPayload;
+            if (outHeader.flags & FLAG_ENCRYPTED) {
+                if (finalPayloadSize <= CHACHA20_IV_SIZE) {
+                    std::cerr << "[DECRYPT] Payload too small for encrypted data!" << std::endl;
+                    return false;
+                }
 
-			if (outHeader.flags & FLAG_ENCRYPTED) {
-				// Validate minimum size (IV + at least 1 byte of data)
-				if (finalPayloadSize <= CHACHA20_IV_SIZE) {
-					std::cerr << "[DECRYPT] Payload too small for encrypted data!" << std::endl;
-					return "";
-				}
+                uint8_t iv[CHACHA20_IV_SIZE];
+                memcpy(iv, ptr, CHACHA20_IV_SIZE);
+                ptr += CHACHA20_IV_SIZE;
+                offs += CHACHA20_IV_SIZE;
 
-				// Extract IV from the beginning of the payload
-				uint8_t iv[CHACHA20_IV_SIZE];
-				std::memcpy(iv, ptr, CHACHA20_IV_SIZE);
-				ptr += CHACHA20_IV_SIZE;
-				offs += CHACHA20_IV_SIZE;
+                const uint8_t* encryptedData = ptr;
+                size_t encryptedSize = dataSize - offs;
 
-				// Point to actual encrypted data (after IV)
-				const uint8_t* encryptedData = ptr;
-				size_t encryptedSize = dataSize - offs;
-
-				// Decrypt (ChaCha20 if available, else XOR)
 #ifdef MBEDTLS_CHACHA20_C
-				mbedtls_chacha20_context ctx;
-				mbedtls_chacha20_init(&ctx);
+                mbedtls_chacha20_context ctx;
+                mbedtls_chacha20_init(&ctx);
+                uint8_t key[32];
+                memset(key, 0x42, 32);
+                mbedtls_chacha20_setkey(&ctx, key);
+                mbedtls_chacha20_starts(&ctx, iv, 0);
 
-				// Use same key as encryption (should derive from handshake)
-				uint8_t key[32];
-				std::memset(key, 0x42, 32); // Placeholder - match encryption side
+                decryptedPayload.resize(encryptedSize);
+                mbedtls_chacha20_update(&ctx, encryptedSize,
+                    encryptedData,
+                    decryptedPayload.data());
+                mbedtls_chacha20_free(&ctx);
 
-				mbedtls_chacha20_setkey(&ctx, key);
-				mbedtls_chacha20_starts(&ctx, iv, 0); // Same counter start = 0
-
-				decryptedPayload.resize(encryptedSize);
-				mbedtls_chacha20_update(&ctx, encryptedSize,
-					encryptedData,
-					decryptedPayload.data());
-				mbedtls_chacha20_free(&ctx);
-
-				finalPayload = decryptedPayload.data();
-				finalPayloadSize = decryptedPayload.size();
+                finalPayload = decryptedPayload.data();
+                finalPayloadSize = decryptedPayload.size();
 #else
-	// Fallback to XOR (symmetric operation)
-				decryptedPayload.assign(encryptedData, encryptedData + encryptedSize);
-				XorObfuscate(decryptedPayload.data(), decryptedPayload.size(), outHeader.nonce);
-				finalPayload = decryptedPayload.data();
-				finalPayloadSize = decryptedPayload.size();
+                decryptedPayload.assign(encryptedData, encryptedData + encryptedSize);
+                XorObfuscate(decryptedPayload.data(), decryptedPayload.size(), outHeader.nonce);
+                finalPayload = decryptedPayload.data();
+                finalPayloadSize = decryptedPayload.size();
 #endif
-			}
+            }
 
+            // NEW: Decompress BEFORE signature verification
+            std::vector<uint8_t> decompressedPayload;
+            if (outHeader.flags & FLAG_COMPRESSED) {
+                decompressedPayload = DecompressData(
+                    (const uint8_t*)finalPayload,
+                    finalPayloadSize,
+                    outHeader.payload_size  // Expected original size
+                );
 
-			// Parse payload
+                if (decompressedPayload.empty()) {
+                    std::cerr << "[DECOMPRESS] Decompression failed!" << std::endl;
+                    return false;
+                }
 
-			// Verify signature if present
-			if (!signatureB64.empty()) {
-				if (senderPubKey.empty()) {
-					std::cerr << "[CRYPTO] Cannot verify signature: no public key" << std::endl;
-					// Still accept for REGISTER packets (first-time key exchange)
-					if (outHeader.type != PT_REGISTER) {
-						return false;
-					}
-				}
-				else {
-					// Verify signature (header + payload)
-					std::vector<uint8_t> signData(packet.begin(),
-						packet.begin() + sizeof(SecurePacketHeader));
+                finalPayload = decompressedPayload.data();
+                finalPayloadSize = decompressedPayload.size();
+            }
 
-					signData.insert(signData.end(),
-						(const uint8_t*)finalPayload,
-						(const uint8_t*)finalPayload + finalPayloadSize);
+            // NEW: Verify signature AFTER decompression (against original data)
+            if (!signatureB64.empty()) {
+                if (senderPubKey.empty()) { 
+                    std::cerr << "[CRYPTO] Cannot verify signature: no public key" << std::endl;                    
+                    return false;
+                    
+                }
+                else {
+                    // Verify against header + DECOMPRESSED payload (original data)
+                    std::vector<uint8_t> signData;
+                    signData.insert(signData.begin(), packet.begin(), packet.begin() + sizeof(SecurePacketHeader));
+                    signData.insert(signData.end(), (const uint8_t*)finalPayload, (const uint8_t*)finalPayload + finalPayloadSize);
 
-					if (!Crypto::Identity::Verify(
-						signData.data(), signData.size(),
-						signatureB64, senderPubKey)) {
-						std::cerr << "[CRYPTO] Signature verification FAILED" << std::endl;
-						return false;
-					}
-					std::cout << "[CRYPTO] Signature verified OK" << std::endl;
-				}
-			}
+                    if (!Crypto::Identity::Verify(
+                        signData.data(), signData.size(),
+                        signatureB64, senderPubKey)) {
+                        std::cerr << "[CRYPTO] Signature verification FAILED" << std::endl;
+                        return false;
+                    }
+                    std::cout << "[CRYPTO] Signature verified OK" << std::endl;
+                }
+            }
 
+            // Extract payload
+            size_t payloadSize = outHeader.payload_size;
+            if (payloadSize > finalPayloadSize) {
+                return false;
+            }
 
+            outPayload.assign((const uint8_t*)finalPayload, (const uint8_t*)finalPayload + payloadSize);
 
-			// Extract payload
-			size_t payloadSize = outHeader.payload_size;
-			if (payloadSize > finalPayloadSize) {
-				return false;
-			}
+            return true;
+        }
 
-			outPayload.assign((const uint8_t*)finalPayload, (const uint8_t*)finalPayload + payloadSize);
-
-			return true;
-		}
-
-	}
+    }
 }

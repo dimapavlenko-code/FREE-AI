@@ -14,14 +14,13 @@
 
 namespace FreeAI {
     namespace Network {
-
-        // NEW: Connection state machine for robust registration
+                
         enum class PeerConnectionState {
             Disconnected,      // Never attempted
-            Connecting,        // REGISTER sent, awaiting ACK
-            Connected,         // REGISTER_ACK received
-            Verified,          // Signature verified, fully trusted
-            Failed             // Multiple failures, in backoff
+            Connecting,        // REGISTER sent, awaiting response
+            Connected,         // Handshake complete (ers_accepted received)
+            Failed,            // Registration failed
+            Reset              // Received ers_failed, clearing state
         };
 
         struct PeerInfo {

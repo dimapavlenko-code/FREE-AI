@@ -1,4 +1,5 @@
 #pragma once
+#include "utils/Helpers.hpp"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,8 +44,6 @@ namespace FreeAI {
             // Set comment for a key (for documentation)
             void SetComment(const std::string& section, const std::string& key, const std::string& comment);
             void SetSectionComment(const std::string& section, const std::string& comment);
-
-            static std::string Trim(const std::string& str);
 
         private:
             std::vector<ConfigSection> m_sections; // Preserve order

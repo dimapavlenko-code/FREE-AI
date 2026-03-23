@@ -1,16 +1,11 @@
-#include "network/NetworkInit.hpp"
+﻿#include "network/NetworkInit.hpp"
+#include "network/PacketSecurity.hpp"  
 #include <iostream>
 
 #ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib") // Link Winsock library automatically on MSVC
-#else
-    #include <sys/socket.h>
-    #include <netinet/in.h>
-    #include <arpa/inet.h>
-    #include <unistd.h>
-    #include <errno.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 #endif
 
 namespace FreeAI {
@@ -19,21 +14,26 @@ namespace FreeAI {
         bool NetworkEnvironment::Initialize() {
 #ifdef _WIN32
             WSADATA wsaData;
-            int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-            if (result != 0) {
-                std::cerr << "[NET] Winsock Startup Failed: " << result << std::endl;
+            int ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (ret != 0) {
                 return false;
             }
-            // Optional: Print Winsock version for transparency
-            // std::cout << "[NET] Winsock Initialized (Version: " << LOBYTE(wsaData.wVersion) << ")" << std::endl;
 #endif
+
+            // Initialize MiniLZO compression
+            if (!PacketSecurity::Initialize()) {
+                std::cerr << "[NETWORK] Failed to initialize compression!" << std::endl;
+                return false;
+            }
+
             return true;
         }
 
         void NetworkEnvironment::Shutdown() {
+            PacketSecurity::Shutdown();
+
 #ifdef _WIN32
             WSACleanup();
-            // std::cout << "[NET] Winsock Cleanup Complete" << std::endl;
 #endif
         }
 
