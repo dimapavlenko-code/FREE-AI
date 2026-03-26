@@ -357,7 +357,7 @@ namespace FreeAI {
                     if (!Crypto::Identity::Verify(
                         signData.data(), signData.size(),
                         signatureB64, senderPubKey)) {
-                        std::cerr << "[CRYPTO] Signature verification FAILED" << std::endl;
+                        std::cerr << "[CRYPTO] Signature verification FAILED signData.size()=" << signData.size() << " signatureB64=" << signatureB64 << " senderPubKey=" << senderPubKey << std::endl;
                         return false;
                     }
                     std::cout << "[CRYPTO] Signature verified OK" << std::endl;

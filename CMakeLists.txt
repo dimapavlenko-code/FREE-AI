@@ -61,6 +61,43 @@ set(HEADERS
     include/utils/Helpers.hpp
 )
 
+# --- llama.cpp Integration ---
+set(BUILD_SHARED_LIBS OFF)
+set(LLAMA_BUILD_TESTS OFF)
+set(LLAMA_BUILD_EXAMPLES OFF)
+set(LLAMA_BUILD_SERVER OFF)
+
+# GPU backend options (uncomment what you need)
+# set(LLAMA_CUDA ON)      # NVIDIA CUDA
+# set(LLAMA_METAL ON)     # Apple Metal
+set(LLAMA_VULKAN ON)    # Vulkan (AMD/Intel)
+# set(LLAMA_HIPBLAS ON)   # AMD ROCm
+
+# CPU-only build (works on all systems)
+set(GGML_NATIVE OFF)        # Disable CPU-specific optimizations for compatibility
+
+add_subdirectory(thirdparty/llama.cpp)
+
+# --- Inference Source Files ---
+set(INFERENCE_SOURCES
+    src/inference/ModelConfig.cpp
+    src/inference/MemoryManager.cpp
+    src/inference/LlamaContext.cpp
+    src/inference/InferenceEngine.cpp
+)
+
+set(INFERENCE_HEADERS
+    include/inference/ModelConfig.hpp
+    include/inference/MemoryManager.hpp
+    include/inference/LlamaContext.hpp
+    include/inference/InferenceEngine.hpp
+)
+
+# Add to main executable
+list(APPEND SOURCES ${INFERENCE_SOURCES})
+list(APPEND HEADERS ${INFERENCE_HEADERS})
+
+
 # --- Executable ---
 add_executable(freeai ${SOURCES} ${HEADERS})
 
@@ -69,6 +106,9 @@ target_link_libraries(freeai PRIVATE mbedcrypto mbedx509 mbedtls ${PLATFORM_LIBS
 if(UNIX)
     target_link_libraries(freeai PRIVATE pthread)
 endif()
+
+# Link llama libraries
+target_link_libraries(freeai PRIVATE llama)
 
 # --- Include Directories ---
 target_include_directories(freeai PRIVATE 

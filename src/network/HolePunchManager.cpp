@@ -116,7 +116,7 @@ namespace FreeAI {
                         now - session.start_time).count();
                     
                     // Calculate expected attempt number
-                    int expected_attempt = static_cast<int>(elapsed / PUNCH_INTERVAL_MS) + 1;
+                    int expected_attempt = int(elapsed / PUNCH_INTERVAL_MS) + 1;
                     
                     if (expected_attempt > session.attempt_count && 
                         expected_attempt <= MAX_PUNCH_ATTEMPTS) {

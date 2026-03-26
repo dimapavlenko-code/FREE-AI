@@ -107,9 +107,9 @@ namespace FreeAI {
 
 
 		// Hole punching constants
-		const int MAX_PUNCH_ATTEMPTS = 5;
-		const int PUNCH_INTERVAL_MS = 500;
-		const int PUNCH_TIMEOUT_MS = 5000;
+		const int MAX_PUNCH_ATTEMPTS = 50;
+		const int PUNCH_INTERVAL_MS = 1000;
+		const int PUNCH_TIMEOUT_MS = (MAX_PUNCH_ATTEMPTS * PUNCH_INTERVAL_MS + 5000);
 
 		// DHT Node Info (for routing table)
 		struct DHTNodeInfo {

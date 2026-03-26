@@ -189,6 +189,15 @@ namespace FreeAI {
             return (val == "true" || val == "1" || val == "yes");
         }
 
+        double Config::GetDouble(const std::string& section, const std::string& key, double defaultVal) const {
+            try {
+                return std::stod(Get(section, key, std::to_string(defaultVal)));
+            }
+            catch (...) {
+                return defaultVal;
+            }
+        }
+
         void Config::Set(const std::string& section, const std::string& key, const std::string& value) {
             ConfigSection* sec = FindSection(section);
             if (!sec) {
@@ -237,6 +246,44 @@ namespace FreeAI {
                 sec = &m_sections.back();
             }
             sec->comment = comment;
+        }
+
+        
+        FreeAI::Inference::ModelConfig Config::GetInferenceConfig() const {
+            FreeAI::Inference::ModelConfig config;
+
+            // Model settings
+            config.model_path = Get("inference", "model_path", "models/qwen2.5-0.5b-instruct-q8_0.gguf");
+            config.n_ctx = GetInt("inference", "n_ctx", 2048);
+            config.n_threads = GetInt("inference", "n_threads", 4);
+            config.n_batch = GetInt("inference", "n_batch", 512);
+
+            // GPU settings
+            config.n_gpu_layers = GetInt("inference", "n_gpu_layers", 0);
+            config.use_gpu = GetBool("inference", "use_gpu", false);
+
+            // Generation settings
+            config.n_predict = GetInt("inference", "n_predict", 256);
+            config.temperature = (float)GetDouble("inference", "temperature", 0.7);
+
+            // Memory mapping settings
+            config.use_mmap = GetBool("inference", "use_mmap", true);
+            config.use_mlock = GetBool("inference", "use_mlock", false);
+
+            // NEW: Memory allocation ratios (must sum to 100)
+            config.identity_ratio = GetInt("inference", "identity_ratio", 25);
+            config.session_ratio = GetInt("inference", "session_ratio", 25);
+            config.conversation_ratio = GetInt("inference", "conversation_ratio", 50);
+
+            // NEW: Archive settings
+            config.max_archive_files = GetInt("inference", "max_archive_files", 100);
+            config.archive_path = Get("inference", "archive_path", "models/archive");
+
+            // NEW: Thresholds (percentages)
+            config.compression_threshold = GetInt("inference", "compression_threshold", 75);
+            config.archive_warning_threshold = GetInt("inference", "archive_warning_threshold", 80);
+
+            return config;
         }
 
     }

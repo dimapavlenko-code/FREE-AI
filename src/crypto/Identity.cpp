@@ -223,6 +223,13 @@ namespace FreeAI {
                 static_cast<const unsigned char*>(data), length,
                 sig, sig_len);
 
+            if (ret != 0) {
+                char error_buf[100];
+                mbedtls_strerror(ret, error_buf, sizeof(error_buf));
+                std::cerr << "[ERROR] mbedtls_pk_verify failed: " << error_buf
+                    << " (code: " << ret << ")" << std::endl;               
+            }
+
             mbedtls_pk_free(&pk);
             return (ret == 0);
         }
