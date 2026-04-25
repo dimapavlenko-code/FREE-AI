@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "network/UDPSocket.hpp"
+#include "network/PeerConnectionTracker.hpp"
 #include "utils/Config.hpp"
 #include "crypto/Identity.hpp"
 #include "network/PacketSecurity.hpp"
@@ -11,17 +12,10 @@
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
+#include <memory>
 
 namespace FreeAI {
     namespace Network {
-                
-        enum class PeerConnectionState {
-            Disconnected,      // Never attempted
-            Connecting,        // REGISTER sent, awaiting response
-            Connected,         // Handshake complete (ers_accepted received)
-            Failed,            // Registration failed
-            Reset              // Received ers_failed, clearing state
-        };
 
         struct PeerInfo {
             std::string ip;
@@ -32,19 +26,6 @@ namespace FreeAI {
             bool is_super_node;
             bool is_direct;  // Can we connect directly (hole punch successful)?
         };
-
-        struct SeedRegistration {
-            std::string ip;
-            int port;
-            std::string seed_address;  // "ip:port" for lookup
-            uint32_t first_attempt_ts;
-            uint32_t last_attempt_ts;
-            uint32_t last_success_ts;          // NEW: Last successful communication
-            PeerConnectionState state;         // NEW: State machine
-            int retry_count;
-            int next_retry_delay_sec;          // NEW: Exponential backoff
-        };
-
         class PeerManager {
             std::vector<PeerInfo> ParsePeerList(const char* data, size_t size);
             std::string BuildPeerList();
@@ -70,9 +51,9 @@ namespace FreeAI {
 
             DHT m_dht;  // DHT engine
 
-            // Track seed registration state            
+            // Track seed registration state using PeerConnectionTracker
             std::thread m_seedThread;
-            std::vector<SeedRegistration> m_seedRegistrations;
+            std::vector<std::shared_ptr<PeerConnectionTracker>> m_seedTrackers;
 
             mutable std::mutex m_networkMutex;  // Single mutex for seeds + keys
 
@@ -120,6 +101,25 @@ namespace FreeAI {
             DHT& GetDHT() { return m_dht; }
             size_t GetDHTNodeCount() const { return m_dht.GetNodeCount(); }
 
+            // STUN/Coordination helper methods
+            ExternalAddress QueryPeerExternalAddress(const std::string& peer_ip, int peer_port);
+            void SendHolePunchInfo(const std::string& ip, int port, const std::string& peer_id,
+                                  const ExternalAddress& peerAddr, uint64_t punchStartTime,
+                                  uint8_t port_range = 0);
+            void SendHolePunchStart(const std::string& ip, int port, uint64_t punchStartTime);
+            void SendCoordHolePunchFailed(const std::string& ip, int port,
+                                         const std::string& requester_id, const std::string& target_id,
+                                         const char* reason);
+            
+            // Send punch failure report to coordinator
+            void SendPunchFailureReport(const std::string& coordinator_ip, int coordinator_port,
+                                       const std::string& peer_id, const std::string& peer_ip,
+                                       int peer_port, uint8_t phase);
+            
+            // Handle punch failure report from peer (only on super node)
+            void HandlePunchFailureReport(const std::string& sender_ip, int sender_port,
+                                         const CoordHolePunchFailedPayload* payload);
+
         private:
             void PunchLoop();  // Background thread for punch attempts
             void ListenLoop();
@@ -127,7 +127,7 @@ namespace FreeAI {
             void ConnectToSeeds();
 
             void SendInitialRegistrations();
-            void SendRegistration(SeedRegistration& reg);
+            void SendRegistration(PeerConnectionTracker::TrackerInfo& reg);
             void SeedRegistrationLoop();
 
             // DHT methods

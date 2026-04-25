@@ -12,7 +12,7 @@ option(ENABLE_TESTS "Build unit tests" ON)
 
 # --- Platform Specifics ---
 if(WIN32)
-    set(PLATFORM_LIBS ws2_32 wsock32)
+    set(PLATFORM_LIBS ws2_32 wsock32 shell32)
     add_definitions(-D_WIN32_WINNT=0x0A00)
     add_definitions(-DNOMINMAX)
 else()
@@ -36,7 +36,9 @@ set(SOURCES
     src/network/NetworkInit.cpp
     src/network/Socket.cpp
     src/network/UDPSocket.cpp
+    src/network/STUNParser.cpp
     src/network/PeerManager.cpp
+    src/network/PeerConnectionTracker.cpp
     src/network/PacketSecurity.cpp
     src/network/HolePunchManager.cpp
     src/network/DHT.cpp
@@ -52,6 +54,7 @@ set(HEADERS
     include/network/UDPSocket.hpp
     include/network/Protocol.hpp
     include/network/PeerManager.hpp
+    include/network/PeerConnectionTracker.hpp
     include/network/PacketSecurity.hpp
     include/network/HolePunchManager.hpp
     include/network/DHT.hpp
@@ -82,6 +85,7 @@ add_subdirectory(thirdparty/llama.cpp)
 set(INFERENCE_SOURCES
     src/inference/ModelConfig.cpp
     src/inference/MemoryManager.cpp
+    src/inference/ContextBuilder.cpp
     src/inference/LlamaContext.cpp
     src/inference/InferenceEngine.cpp
 )
@@ -102,7 +106,7 @@ list(APPEND HEADERS ${INFERENCE_HEADERS})
 add_executable(freeai ${SOURCES} ${HEADERS})
 
 # --- Link Libraries ---
-target_link_libraries(freeai PRIVATE mbedcrypto mbedx509 mbedtls ${PLATFORM_LIBS})
+target_link_libraries(freeai PRIVATE mbedcrypto mbedx509 mbedtls ${PLATFORM_LIBS} shell32)
 if(UNIX)
     target_link_libraries(freeai PRIVATE pthread)
 endif()
@@ -134,3 +138,5 @@ if(ENABLE_TESTS)
     add_executable(freeai_test tests/test_main.cpp)
     target_link_libraries(freeai_test PRIVATE ${PLATFORM_LIBS})
 endif()
+
+

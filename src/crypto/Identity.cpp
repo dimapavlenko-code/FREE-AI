@@ -1,5 +1,6 @@
 #include "crypto/Identity.hpp"
 #include "network/Protocol.hpp"
+#include "network/DHT.hpp"
 #include <mbedtls/pk.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/entropy.h>
@@ -241,16 +242,10 @@ namespace FreeAI {
         std::string Identity::GetShortID() const {
             if (!m_valid) return "INVALID";
             std::string pem = GetPublicKeyPEM();
-            auto pemsz = pem.size();
-            if (pemsz < 20) return "ERROR";
-            std::stringstream ss;
+            Network::NodeId nid;
+            nid.FromPubkey(pem);
 
-            auto pemsz_2 = pemsz / 2;
-            for (size_t i = 0; i < 8 && i < pemsz_2; ++i) {
-                ss << std::hex << std::setw(2) << std::setfill('0')
-                    << static_cast<int>(pem[i + pemsz_2]);
-            }
-            return ss.str().substr(0, 8);
+            return nid.ToString(8);
         }
 
     }

@@ -207,25 +207,19 @@ namespace FreeAI {
 						StorePeerPublicKey(peer_id, pubkey_pem);
 						AddPeer({ ip, port, peer_id, pubkey_pem, std::time(nullptr), true, false });
 
-						uint8_t dht_node_id[20];
-						mbedtls_sha1_context ctx;
-						mbedtls_sha1_init(&ctx);
-						mbedtls_sha1_starts(&ctx);
-						mbedtls_sha1_update(&ctx,
-							reinterpret_cast<const unsigned char*>(pubkey_pem.c_str()),
-							pubkey_pem.size());
-						mbedtls_sha1_finish(&ctx, dht_node_id);
-						mbedtls_sha1_free(&ctx);
+						NodeId dht_node_id;
+						dht_node_id.FromPubkey(pubkey_pem);
 
 						m_dht.AddNode(dht_node_id, ip, port);
-						std::cout << "[DHT] Added peer to routing table: " << peer_id << std::endl;
+						std::cout << "[DHT] Added peer to routing table: " << peer_id << " DHT node id: " << dht_node_id.ToString(16) << std::endl;
 
 						{
 							std::lock_guard<std::mutex> lock(m_networkMutex);
-							for (auto& sreg : m_seedRegistrations) {
-								if (sreg.ip == ip && sreg.port == port) {
-									sreg.state = PeerConnectionState::Connecting;
-									sreg.last_success_ts = static_cast<uint32_t>(std::time(nullptr));
+							for (auto& tracker : m_seedTrackers) {
+								auto info = tracker->GetInfo();
+								if (info.ip == ip && info.port == port) {
+									tracker->SetState(PeerConnectionState::Connecting);
+									tracker->SetLastSuccessTime(static_cast<uint32_t>(std::time(nullptr)));
 									break;
 								}
 							}
@@ -233,10 +227,13 @@ namespace FreeAI {
 
 						RegisterPayload resp;
 						std::memset(&resp, 0, sizeof(resp));
-						strncpy(resp.peer_id, m_identity->GetShortID().c_str(), sizeof(resp.peer_id) - 1);
 						auto mypubkey = m_identity->GetPublicKeyPEM();
+						auto short_id = m_identity->GetShortID();
+						auto peer_id_len = std::min(short_id.size(), sizeof(resp.peer_id) - 1);
+						std::memcpy(resp.peer_id, short_id.c_str(), peer_id_len);
+						resp.peer_id[peer_id_len] = '\0';
 						resp.pubkey_size = (uint16_t)mypubkey.size();
-						strncpy((char*)resp.pubkey, mypubkey.c_str(), resp.pubkey_size);
+						std::memcpy(resp.pubkey, mypubkey.c_str(), resp.pubkey_size);
 						resp.step = ers_register_resp;
 
 						SendSecurePacket(sock, ip, port, PT_REGISTER, &resp, sizeof(resp));
@@ -252,18 +249,19 @@ namespace FreeAI {
 
 						{
 							std::lock_guard<std::mutex> lock(m_networkMutex);
-							for (auto& sreg : m_seedRegistrations) {
-								if (sreg.ip == ip && sreg.port == port) {
-									sreg.state = PeerConnectionState::Connecting;
-									sreg.last_success_ts = static_cast<uint32_t>(std::time(nullptr));
+							for (auto& tracker : m_seedTrackers) {
+								auto info = tracker->GetInfo();
+								if (info.ip == ip && info.port == port) {
+									tracker->SetState(PeerConnectionState::Connecting);
+									tracker->SetLastSuccessTime(static_cast<uint32_t>(std::time(nullptr)));
 									break;
 								}
 							}
 						}
-
+	
 						RegisterPayload ack;
 						std::memset(&ack, 0, sizeof(ack));
-						strncpy(ack.peer_id, m_identity->GetShortID().c_str(), sizeof(ack.peer_id) - 1);
+						fai_strncpy(ack.peer_id, m_identity->GetShortID(), sizeof(ack.peer_id));
 						ack.pubkey_size = 0;
 						ack.step = ers_accepted;
 
@@ -272,9 +270,10 @@ namespace FreeAI {
 
 						{
 							std::lock_guard<std::mutex> lock(m_networkMutex);
-							for (auto& sreg : m_seedRegistrations) {
-								if (sreg.ip == ip && sreg.port == port) {
-									sreg.state = PeerConnectionState::Connected;
+							for (auto& tracker : m_seedTrackers) {
+								auto info = tracker->GetInfo();
+								if (info.ip == ip && info.port == port) {
+									tracker->SetState(PeerConnectionState::Connected);
 									break;
 								}
 							}
@@ -288,10 +287,11 @@ namespace FreeAI {
 
 						{
 							std::lock_guard<std::mutex> lock(m_networkMutex);
-							for (auto& sreg : m_seedRegistrations) {
-								if (sreg.ip == ip && sreg.port == port) {
-									sreg.state = PeerConnectionState::Connected;
-									sreg.last_success_ts = static_cast<uint32_t>(std::time(nullptr));
+							for (auto& tracker : m_seedTrackers) {
+								auto info = tracker->GetInfo();
+								if (info.ip == ip && info.port == port) {
+									tracker->SetState(PeerConnectionState::Connected);
+									tracker->SetLastSuccessTime(static_cast<uint32_t>(std::time(nullptr)));
 									break;
 								}
 							}
@@ -307,11 +307,10 @@ namespace FreeAI {
 							std::lock_guard<std::mutex> lock(m_networkMutex);
 							m_peerPublicKeys.erase(peer_id);
 
-							for (auto& sreg : m_seedRegistrations) {
-								if (sreg.ip == ip && sreg.port == port) {
-									sreg.state = PeerConnectionState::Disconnected;
-									sreg.retry_count = 0;
-									sreg.next_retry_delay_sec = 2;
+							for (auto& tracker : m_seedTrackers) {
+								auto info = tracker->GetInfo();
+								if (info.ip == ip && info.port == port) {
+									tracker->SetState(PeerConnectionState::Reset);
 									break;
 								}
 							}
@@ -339,9 +338,9 @@ namespace FreeAI {
 					if (peer.peer_id == target_id) {
 						IntroResponsePayload response;
 						std::memset(&response, 0, sizeof(response));
-						strncpy(response.target_ip, peer.ip.c_str(), sizeof(response.target_ip) - 1);
+						fai_strncpy(response.target_ip, peer.ip, sizeof(response.target_ip));
 						response.target_port = static_cast<uint16_t>(peer.port);
-						strncpy(response.target_id, peer.peer_id.c_str(), sizeof(response.target_id) - 1);
+						fai_strncpy(response.target_id, peer.peer_id, sizeof(response.target_id));
 						response.target_pubkey_size = static_cast<uint16_t>(peer.public_key_pem.size());
 
 						std::vector<uint8_t> responsePacket;
@@ -389,17 +388,9 @@ namespace FreeAI {
 					AddPeer(p);
 
 					if (!p.public_key_pem.empty()) {
-						uint8_t dht_node_id[20];
-						mbedtls_sha1_context ctx;
-						mbedtls_sha1_init(&ctx);
-						mbedtls_sha1_starts(&ctx);
-						mbedtls_sha1_update(&ctx,
-							(const unsigned char*)p.public_key_pem.c_str(),
-							p.public_key_pem.size());
-						mbedtls_sha1_finish(&ctx, dht_node_id);
-						mbedtls_sha1_free(&ctx);
-
-						m_dht.AddNode(dht_node_id, p.ip, p.port);
+						NodeId nid;
+						nid.FromPubkey(p.public_key_pem);
+						m_dht.AddNode(nid, p.ip, p.port);
 					}
 				}
 				std::cout << "[PEER] Received " << newPeers.size() << " peers from seed." << std::endl;
@@ -413,9 +404,140 @@ namespace FreeAI {
 			}
 			else if (header.type == PT_PUNCH_ACK) {
 				std::cout << "[PUNCH] Received punch ACK from " << ip << ":" << port << std::endl;
+				// Punch ACK packets are sent in plain format (header + payload directly)
+				// Check if the payload starts with a valid SecurePacketHeader (encrypted format)
+				// or directly with PunchPayload (plain format)
 				if (payload.size() >= sizeof(PunchPayload)) {
-					auto punch = (const PunchPayload*)payload.data();
-					m_punchManager.MarkSuccess(punch->sender_id);
+					// Check if this is a plain punch packet (magic_xor matches MAGIC_NUMBER with flags=0)
+					const auto* plainPayload = reinterpret_cast<const PunchPayload*>(payload.data());
+					
+					// Verify it looks like a plain punch payload (not encrypted data)
+					// Plain punch payloads have readable sender_id
+					bool looksValid = true;
+					for (int i = 0; i < sizeof(plainPayload->sender_id) && looksValid; ++i) {
+						char c = plainPayload->sender_id[i];
+						if (c != '\0' && (c < ' ' || c > '~')) {
+							looksValid = false;
+						}
+					}
+					
+					if (looksValid && strlen(plainPayload->sender_id) > 0) {
+						m_punchManager.MarkSuccess(plainPayload->sender_id);
+						std::cout << "[PUNCH] SUCCESS! Direct connection to " << plainPayload->sender_id << " established" << std::endl;
+					}
+				}
+			}
+			else if (header.type == PT_COORD_HOLE_PUNCH_INFO) {
+				// Coordinator sent us hole punch info
+				if (m_punchManager.HandleHolePunchInfo(ip, static_cast<int>(port),
+					reinterpret_cast<const char*>(payload.data()), static_cast<int>(payload.size()))) {
+					std::cout << "[COORD] Hole punch info processed successfully." << std::endl;
+				}
+				else {
+					std::cerr << "[COORD] Failed to process hole punch info from " << ip << ":" << port << std::endl;
+				}
+			}
+			else if (header.type == PT_COORD_HOLE_PUNCH_START) {
+				// Coordinator sent us hole punch start signal
+				if (m_punchManager.HandleHolePunchStart(ip, static_cast<int>(port),
+					reinterpret_cast<const char*>(payload.data()), static_cast<int>(payload.size()))) {
+					std::cout << "[COORD] Hole punch start signal processed." << std::endl;
+				}
+			}
+			else if (header.type == PT_COORD_HOLE_PUNCH_FAILED) {
+				// Handle failure report or failure notification
+				if (payload.size() >= sizeof(CoordHolePunchFailedPayload)) {
+					const CoordHolePunchFailedPayload* failPayload = reinterpret_cast<const CoordHolePunchFailedPayload*>(payload.data());
+					
+					// Check if this is a failure report (has peer_id and peer_ip fields)
+					if (strlen(failPayload->peer_id) > 0 && failPayload->phase <= 1) {
+						HandlePunchFailureReport(ip, port, failPayload);
+					}
+					else {
+						// It's a regular failure notification
+						std::cerr << "[COORD] Received failure notification from " << ip << ":" << port << std::endl;
+					}
+				}
+			}
+			else if (header.type == PT_COORD_HOLE_PUNCH_MULTI_START) {
+				// Received multi-port punch coordination from super node
+				if (payload.size() >= sizeof(CoordHolePunchMultiStartPayload)) {
+					const CoordHolePunchMultiStartPayload* multiStart = reinterpret_cast<const CoordHolePunchMultiStartPayload*>(payload.data());
+					std::string target_id(multiStart->peer_id);
+					std::string target_ip(multiStart->peer_ip);
+					int target_port = ntohs(multiStart->peer_base_port);
+					uint8_t port_range = multiStart->peer_port_range;
+					
+					std::cout << "[COORD] Received multi-port punch coordination for peer " << target_id
+					          << " @ " << target_ip << ":" << target_port << " (range: " << static_cast<int>(port_range) << ")" << std::endl;
+					
+					// Start multi-port punch to the target
+					m_punchManager.StartMultiPortPunch(target_ip, target_port, port_range, target_id);
+				}
+			}
+			else if (header.type == PT_COORD_HOLE_PUNCH_REQUEST) {
+				// Received a hole punch request (only process if we're a super node)
+				if (m_isSuperNode && payload.size() >= sizeof(CoordHolePunchPayload)) {
+					const CoordHolePunchPayload* req = reinterpret_cast<const CoordHolePunchPayload*>(payload.data());
+					std::string requester_id(req->requester_id);
+					std::string target_id(req->target_id);
+
+					std::cout << "[COORD] Received hole punch request from " << requester_id
+					          << " for target " << target_id << std::endl;
+
+					// Find the target peer
+					auto knownPeers = GetKnownPeers();
+					PeerInfo* targetPeer = nullptr;
+					for (auto& peer : knownPeers) {
+						if (peer.peer_id == target_id) {
+							targetPeer = &peer;
+							break;
+						}
+					}
+
+					if (!targetPeer) {
+						std::cerr << "[COORD] Target peer " << target_id << " not found." << std::endl;
+						// Send failure response
+						SendCoordHolePunchFailed(ip, port, requester_id, target_id, "Target not found");
+						return;
+					}
+
+					// Query STUN servers for both peers' external addresses
+					// For simplicity, use the coordinator's own STUN server (us)
+					// In a real implementation, each peer would have their own STUN server
+					
+					// Get external address of the requester (from the connection)
+					ExternalAddress requesterExternal;
+					requesterExternal.ip = ip;
+					requesterExternal.port = port;
+					requesterExternal.discovered = true;
+
+					// For the target, we need to query their STUN server
+					// In this simplified version, we use the target's reported address
+					ExternalAddress targetExternal;
+					targetExternal.ip = targetPeer->ip;
+					targetExternal.port = targetPeer->port;
+					targetExternal.discovered = true;
+
+					std::cout << "[COORD] Requester external: " << requesterExternal.ip << ":" << requesterExternal.port << std::endl;
+					std::cout << "[COORD] Target external: " << targetExternal.ip << ":" << targetExternal.port << std::endl;
+
+					// Calculate punch start time (2 seconds from now to allow both peers to prepare)
+					auto now = std::chrono::steady_clock::now();
+					auto punchStartTime = std::chrono::duration_cast<std::chrono::milliseconds>(
+						now.time_since_epoch()).count() + 2000;
+
+					// Send hole punch info to the requester
+					SendHolePunchInfo(ip, port, target_id, targetExternal, punchStartTime);
+
+					// Send hole punch info to the target
+					SendHolePunchInfo(targetPeer->ip, targetPeer->port, requester_id, requesterExternal, punchStartTime);
+
+					// Send start signal to both
+					SendHolePunchStart(ip, port, punchStartTime);
+					SendHolePunchStart(targetPeer->ip, targetPeer->port, punchStartTime);
+
+					std::cout << "[COORD] Hole punch coordination complete for " << requester_id << " <-> " << target_id << std::endl;
 				}
 			}
 			else if (header.type >= PT_DHT_FIND_NODE && header.type <= PT_DHT_PING) {
@@ -445,12 +567,12 @@ namespace FreeAI {
 			}
 		}
 
-		void PeerManager::HandleDHTFindNode(UDPSocket& sock, const std::string& ip, int port,
+		void PeerManager::HandleDHTFindNode(UDPSocket& /*sock*/, const std::string& ip, int port,
 			const DHTFindNodePayload* payload) {
 			std::cout << "[DHT] FIND_NODE request from " << ip << ":" << port << std::endl;
 
-			auto closestNodes = m_dht.FindNodes(
-				reinterpret_cast<const uint8_t*>(payload->target_id));
+			NodeId targetId(payload->target_id);
+			auto closestNodes = m_dht.FindNodes(targetId);
 
 			DHTFindNodeResponsePayload response;
 			memset(&response, 0, sizeof(response));
@@ -466,9 +588,8 @@ namespace FreeAI {
 				DHTNodeInfo nodeInfo;
 				memset(&nodeInfo, 0, sizeof(nodeInfo));
 
-				memcpy(nodeInfo.node_id, closestNodes[i].node_id, DHT_NODE_ID_SIZE);
-				strncpy(nodeInfo.ip, closestNodes[i].ip.c_str(), sizeof(nodeInfo.ip) - 1);
-				nodeInfo.ip[sizeof(nodeInfo.ip) - 1] = '\0';
+				memcpy(nodeInfo.node_id, closestNodes[i].node_id.Data(), DHT_NODE_ID_SIZE);
+				fai_strncpy(nodeInfo.ip, closestNodes[i].ip, sizeof(nodeInfo.ip));
 				nodeInfo.port = static_cast<uint16_t>(closestNodes[i].port);
 				nodeInfo.last_seen = closestNodes[i].last_seen;
 
@@ -495,15 +616,10 @@ namespace FreeAI {
 				const DHTNodeInfo* nodeInfo = reinterpret_cast<const DHTNodeInfo*>(
 					ptr + i * sizeof(DHTNodeInfo));
 
-				m_dht.AddNode(
-					reinterpret_cast<const uint8_t*>(nodeInfo->node_id),
-					nodeInfo->ip, nodeInfo->port);
+				NodeId nid(nodeInfo->node_id);
+				m_dht.AddNode(nid, nodeInfo->ip, nodeInfo->port);
 
-				std::cout << "[DHT] Learned about node: ";
-				for (int j = 0; j < 8; ++j) {
-					printf("%02x", (unsigned int)(nodeInfo->node_id[j]));
-				}
-				std::cout << " @ " << nodeInfo->ip << ":" << nodeInfo->port << std::endl;
+				std::cout << "[DHT] Learned about node: " << nid.ToString(16) << " @ " << nodeInfo->ip << ":" << nodeInfo->port << std::endl;
 			}
 		}
 
@@ -516,18 +632,12 @@ namespace FreeAI {
 					size_t pos = seed.find(':');
 					if (pos == std::string::npos) continue;
 
-					SeedRegistration reg;
-					reg.seed_address = seed;
-					reg.ip = seed.substr(0, pos);
-					reg.port = std::stoi(seed.substr(pos + 1));
-					reg.first_attempt_ts = 0;
-					reg.last_attempt_ts = 0;
-					reg.last_success_ts = 0;
-					reg.state = PeerConnectionState::Disconnected;
-					reg.retry_count = 0;
-					reg.next_retry_delay_sec = 2;
+					std::string seed_ip = seed.substr(0, pos);
+					int seed_port = std::stoi(seed.substr(pos + 1));
 
-					m_seedRegistrations.push_back(reg);
+					auto tracker = std::make_shared<PeerConnectionTracker>();
+					tracker->Initialize(seed, seed_ip, seed_port);
+					m_seedTrackers.push_back(tracker);
 				}
 			}
 
@@ -537,17 +647,17 @@ namespace FreeAI {
 		void PeerManager::SendInitialRegistrations() {
 			std::lock_guard<std::mutex> lock(m_networkMutex);
 
-			for (auto& reg : m_seedRegistrations) {
-				if (reg.state == PeerConnectionState::Disconnected) {
-					SendRegistration(reg);
-					reg.state = PeerConnectionState::Connecting;
-					reg.first_attempt_ts = static_cast<uint32_t>(std::time(nullptr));
-					reg.last_attempt_ts = reg.first_attempt_ts;
+			for (auto& tracker : m_seedTrackers) {
+				auto info = tracker->GetInfo();
+				if (info.state == PeerConnectionState::Disconnected) {
+					SendRegistration(info);
+					tracker->SetState(PeerConnectionState::Connecting);
+					tracker->SetLastSuccessTime(static_cast<uint32_t>(std::time(nullptr)));
 				}
 			}
 		}
 
-		void PeerManager::SendRegistration(SeedRegistration& reg) {
+		void PeerManager::SendRegistration(PeerConnectionTracker::TrackerInfo& info) {
 			if (!m_identity || !m_identity->IsValid()) {
 				std::cerr << "[PEER] Cannot register: identity not valid!" << std::endl;
 				return;
@@ -559,20 +669,19 @@ namespace FreeAI {
 			RegisterPayload regPayload;
 			std::memset(&regPayload, 0, sizeof(regPayload));
 
-			strncpy(regPayload.peer_id, peer_id.c_str(), sizeof(regPayload.peer_id) - 1);
-			regPayload.peer_id[sizeof(regPayload.peer_id) - 1] = '\0';
+			fai_strncpy(regPayload.peer_id, peer_id, sizeof(regPayload.peer_id));
 			regPayload.step = ers_register;
 			regPayload.pubkey_size = static_cast<uint16_t>(pubkey_pem.size());
 			std::memcpy(regPayload.pubkey, pubkey_pem.c_str(), pubkey_pem.size());
 
-			SendSecurePacket(m_socket, reg.ip, reg.port, PT_REGISTER,
+			SendSecurePacket(m_socket, info.ip, info.port, PT_REGISTER,
 				&regPayload, sizeof(regPayload));
 
-			reg.last_attempt_ts = static_cast<uint32_t>(std::time(nullptr));
-			reg.retry_count++;
+			info.last_attempt_ts = static_cast<uint32_t>(std::time(nullptr));
+			info.retry_count++;
 
-			std::cout << "[PEER] Sent REGISTER to " << reg.ip << ":" << reg.port
-				<< " (attempt " << reg.retry_count << ", delay " << reg.next_retry_delay_sec << "s)" << std::endl;
+			std::cout << "[PEER] Sent REGISTER to " << info.ip << ":" << info.port
+				<< " (attempt " << info.retry_count << ", delay " << info.next_retry_delay_sec << "s)" << std::endl;
 		}
 
 		void PeerManager::SeedRegistrationLoop() {
@@ -582,80 +691,87 @@ namespace FreeAI {
 				std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
 				uint32_t curTs = static_cast<uint32_t>(std::time(nullptr));
-				bool allVerified = true;
+				bool allConnected = true;
 
 				std::lock_guard<std::mutex> lock(m_networkMutex);
 
-				for (auto& reg : m_seedRegistrations) {
-					if (reg.state == PeerConnectionState::Connected) {
+				for (auto& tracker : m_seedTrackers) {
+					auto info = tracker->GetInfo();
+					
+					// Check if already connected
+					if (info.state == PeerConnectionState::Connected) {
 						continue;
 					}
+
+					allConnected = false;
 
 					if (!m_identity || !m_identity->IsValid()) {
-						allVerified = false;
 						continue;
 					}
 
-					switch (reg.state) {
+					// Try to recover from failed state
+					if (tracker->TryRecover(curTs)) {
+						info = tracker->GetInfo();
+					}
+
+					// Check if we should retry
+					if (!tracker->ShouldRetry(curTs)) {
+						continue;
+					}
+
+					switch (info.state) {
 					case PeerConnectionState::Disconnected:
-						SendRegistration(reg);
-						reg.state = PeerConnectionState::Connecting;
-						reg.retry_count = 1;
-						reg.next_retry_delay_sec = 2;
-						allVerified = false;
+					case PeerConnectionState::Reset:
+						if (tracker->RecordRetryAttempt()) {
+							SendRegistration(info);
+							tracker->SetState(PeerConnectionState::Connecting);
+							std::cout << "[PEER] Initial registration to " << info.ip
+								<< ":" << info.port << std::endl;
+						} else {
+							tracker->SetState(PeerConnectionState::Failed);
+							std::cerr << "[PEER] Registration failed for " << info.seed_address
+								<< " after max retries" << std::endl;
+						}
 						break;
 
 					case PeerConnectionState::Connecting:
-						if (curTs > reg.last_attempt_ts + static_cast<uint32_t>(reg.next_retry_delay_sec)) {
-							reg.next_retry_delay_sec = std::min(reg.next_retry_delay_sec * 2, 60);
-							reg.retry_count++;
-
-							if (reg.retry_count <= 10) {
-								SendRegistration(reg);
-								std::cout << "[PEER] Retrying registration with " << reg.ip
-									<< ":" << reg.port << " (attempt " << reg.retry_count
-									<< ", delay " << reg.next_retry_delay_sec << "s)" << std::endl;
-							}
-							else {
-								reg.state = PeerConnectionState::Failed;
-								std::cerr << "[PEER] Registration failed with " << reg.ip
-									<< ":" << reg.port << " after " << reg.retry_count << " attempts" << std::endl;
-							}
+						if (tracker->RecordRetryAttempt()) {
+							SendRegistration(info);
+							std::cout << "[PEER] Retrying registration with " << info.ip
+								<< ":" << info.port << " (attempt " << info.retry_count << ")" << std::endl;
+						} else {
+							tracker->SetState(PeerConnectionState::Failed);
+							std::cerr << "[PEER] Registration failed for " << info.seed_address
+								<< " after " << info.retry_count << " attempts" << std::endl;
 						}
-						allVerified = false;
 						break;
 
 					case PeerConnectionState::Failed:
-						if (curTs > reg.last_attempt_ts + 300) {
-							reg.state = PeerConnectionState::Disconnected;
-							reg.retry_count = 0;
-							reg.next_retry_delay_sec = 2;
-							std::cout << "[PEER] Recovering failed connection to " << reg.ip << ":" << reg.port << std::endl;
-						}
-						allVerified = false;
+						std::cout << "[PEER] Waiting for recovery delay for " << info.seed_address << std::endl;
 						break;
 
-					case PeerConnectionState::Connected:
+					default:
 						break;
 					}
 				}
 
 				static bool dhtDiscoverySent = false;
-				if (!dhtDiscoverySent && allVerified && !m_seedRegistrations.empty()) {
+				if (!dhtDiscoverySent && PeerConnectionTracker::AllConnected(m_seedTrackers) && !m_seedTrackers.empty()) {
 					dhtDiscoverySent = true;
 
 					uint8_t random_target[20];
 					memset(random_target, 0, 20);
 
-					for (const auto& reg : m_seedRegistrations) {
+					for (const auto& tracker : m_seedTrackers) {
+						auto info = tracker->GetInfo();
 						DHTFindNodePayload findPayload;
 						memset(&findPayload, 0, sizeof(findPayload));
 						memcpy(findPayload.target_id, random_target, 20);
 
-						m_dht.SendDHTPacket(&m_socket, reg.ip, reg.port, PT_DHT_FIND_NODE,
+						m_dht.SendDHTPacket(&m_socket, info.ip, info.port, PT_DHT_FIND_NODE,
 							&findPayload, sizeof(findPayload));
 
-						std::cout << "[DHT] Sent FIND_NODE to " << reg.ip << ":" << reg.port << std::endl;
+						std::cout << "[DHT] Sent FIND_NODE to " << info.ip << ":" << info.port << std::endl;
 					}
 
 					std::cout << "[DHT] Final routing table has " << m_dht.GetNodeCount() << " nodes" << std::endl;
@@ -683,7 +799,7 @@ namespace FreeAI {
 
 					if (pos3 != std::string::npos) {
 						p.peer_id = line.substr(pos2 + 1, pos3 - pos2 - 1);
-						p.public_key_pem = line.substr(pos3 + 1);
+						p.public_key_pem = TrimNulls(line.substr(pos3 + 1));
 					}
 					else {
 						p.peer_id = line.substr(pos2 + 1);
@@ -734,13 +850,36 @@ namespace FreeAI {
 			while (m_running) {
 				m_punchManager.Cleanup();
 
+				// Process single-port punch sessions
 				auto activeSessions = m_punchManager.GetActiveSessions();
 				for (const auto& session : activeSessions) {
-					if (m_punchManager.ShouldSendPunch(session.target_id)) {
+					// Check if we should send a punch packet
+					if (m_punchManager.ShouldSendPunchAuto(session.target_id)) {
 						SendPunchPacket(session.target_ip, session.target_port, session.target_id);
 						m_punchManager.RecordAttempt(session.target_id);
+						
+						// Check if we should switch to multi-port punching
+						if (m_punchManager.ShouldSwitchToMultiPort(session.target_id)) {
+							std::cout << "[PUNCH] Single-port failed for peer " << session.target_id
+								<< ", switching to multi-port punch" << std::endl;
+							m_punchManager.SwitchToMultiPortPunch(session.target_id);
+						}
 					}
 				}
+
+				// Process multi-port punch sessions
+				auto activeMultiPortSessions = m_punchManager.GetActiveMultiPortSessions();
+				for (const auto& session : activeMultiPortSessions) {
+					if (m_punchManager.ShouldSendPunchAuto(session.target_id)) {
+						// Send punch packets across the port range
+						m_punchManager.SendMultiPortPunch(session.target_ip, session.target_base_port,
+							session.target_port_range, session.target_id);
+					}
+				}
+
+				// Removed redundant counter-punch loop (Issue #6 from review)
+				// The active session loops above already handle punching targets
+				// This redundant loop wasted bandwidth and confused attempt counting
 
 				std::this_thread::sleep_for(std::chrono::milliseconds(PUNCH_INTERVAL_MS));
 			}
@@ -757,28 +896,106 @@ namespace FreeAI {
 			std::memset(&payload, 0, sizeof(payload));
 
 			std::string short_id = m_identity ? m_identity->GetShortID() : "unknown";
-			std::strncpy(payload.sender_id, short_id.c_str(), sizeof(payload.sender_id) - 1);
-			payload.timestamp = std::time(nullptr);
-			payload.attempt_num = 1;
+			fai_strncpy(payload.sender_id, short_id, sizeof(payload.sender_id));
+			// Use milliseconds since epoch for consistent timestamp handling
+			payload.timestamp = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+			
+			// Get the current attempt count for this session
+			uint8_t attempt = static_cast<uint8_t>(m_punchManager.GetAttemptCount(peer_id) + 1);
+			payload.attempt_num = attempt;
 
-			std::cout << "[PUNCH] Sending punch to " << ip << ":" << port << std::endl;
-			SendSecurePacket(m_socket, ip, port, PT_PUNCH, &payload, sizeof(payload));
+			std::cout << "[PUNCH] Sending punch (attempt " << (int)attempt << ") to " << ip << ":" << port << std::endl;
+			
+			// Send as a plain UDP packet without encryption for hole punching
+			// This is critical for NAT traversal - the target needs to see our source IP/port
+			// Prepare the packet with SecurePacketHeader but without encryption
+			SecurePacketHeader header;
+			std::memset(&header, 0, sizeof(header));
+			header.magic_xor = MAGIC_NUMBER;
+			header.nonce = static_cast<uint32_t>(payload.timestamp);
+			header.flags = 0;  // No signing, no encryption for punch packets
+			header.type = PT_PUNCH;
+			header.payload_size = static_cast<uint16_t>(sizeof(PunchPayload));
+
+			std::vector<uint8_t> packet(sizeof(SecurePacketHeader) + sizeof(PunchPayload));
+			std::memcpy(packet.data(), &header, sizeof(SecurePacketHeader));
+			std::memcpy(packet.data() + sizeof(SecurePacketHeader), &payload, sizeof(PunchPayload));
+
+			int sent = m_socket.SendTo(packet.data(), packet.size(), ip, port);
+			if (sent < 0) {
+				std::cerr << "[PUNCH] Failed to send punch packet to " << ip << ":" << port << std::endl;
+			}
 		}
 
 		void PeerManager::HandlePunchPacket(const std::string& ip, int port, const PunchPayload* payload) {
-			std::cout << "[PUNCH] Received punch from " << payload->sender_id
-				<< " @ " << ip << ":" << port << std::endl;
+			std::string sender_id(payload->sender_id);
+			std::cout << "[PUNCH] Received punch from " << sender_id
+				<< " @ " << ip << ":" << port << " (attempt " << (int)payload->attempt_num << ")" << std::endl;
 
-			SendSecurePacket(m_socket, ip, port, PT_PUNCH_ACK, payload, sizeof(PunchPayload));
-
-			auto peers = GetKnownPeers();
-			for (const auto& peer : peers) {
-				if (peer.peer_id == payload->sender_id) {
-					break;
+			// Verify the sender is a known peer before proceeding
+			bool isKnownPeer = false;
+			{
+				auto peers = GetKnownPeers();
+				for (const auto& peer : peers) {
+					if (peer.peer_id == sender_id) {
+						isKnownPeer = true;
+						break;
+					}
 				}
 			}
 
-			m_punchManager.MarkSuccess(payload->sender_id);
+			if (!isKnownPeer) {
+				std::cout << "[PUNCH] Ignoring punch from unknown peer: " << sender_id << std::endl;
+				return;
+			}
+
+			// Check if we have an active punch session for this peer
+			if (!m_punchManager.IsPunchActive(sender_id)) {
+				std::cout << "[PUNCH] No active punch session for " << sender_id << ", ignoring" << std::endl;
+				return;
+			}
+
+			// Verify timestamp is recent (within 60 seconds) to prevent replay attacks
+			// Both timestamps are now in milliseconds since epoch
+			auto nowMs = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+			if (std::abs(static_cast<int64_t>(nowMs) - static_cast<int64_t>(payload->timestamp)) > 60000) {
+				std::cout << "[PUNCH] Punch from " << sender_id << " has stale timestamp, ignoring" << std::endl;
+				return;
+			}
+
+			// Send PUNCH_ACK back to the sender
+			// This ACK also needs to be unencrypted for hole punching to work
+			PunchPayload ackPayload;
+			std::memset(&ackPayload, 0, sizeof(ackPayload));
+			fai_strncpy(ackPayload.sender_id, m_identity->GetShortID(), sizeof(ackPayload.sender_id));
+			ackPayload.timestamp = static_cast<uint64_t>(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count());
+			ackPayload.attempt_num = payload->attempt_num;
+
+			SecurePacketHeader ackHeader;
+			std::memset(&ackHeader, 0, sizeof(ackHeader));
+			ackHeader.magic_xor = MAGIC_NUMBER;
+			ackHeader.nonce = static_cast<uint32_t>(ackPayload.timestamp);
+			ackHeader.flags = 0;
+			ackHeader.type = PT_PUNCH_ACK;
+			ackHeader.payload_size = static_cast<uint16_t>(sizeof(PunchPayload));
+
+			std::vector<uint8_t> ackPacket(sizeof(SecurePacketHeader) + sizeof(PunchPayload));
+			std::memcpy(ackPacket.data(), &ackHeader, sizeof(SecurePacketHeader));
+			std::memcpy(ackPacket.data() + sizeof(SecurePacketHeader), &ackPayload, sizeof(PunchPayload));
+
+			int sent = m_socket.SendTo(ackPacket.data(), ackPacket.size(), ip, port);
+			if (sent < 0) {
+				std::cerr << "[PUNCH] Failed to send PUNCH_ACK to " << ip << ":" << port << std::endl;
+			}
+			else {
+				std::cout << "[PUNCH] Sent PUNCH_ACK to " << ip << ":" << port << std::endl;
+			}
 		}
 
 		void PeerManager::StorePeerPublicKey(const std::string& peer_id, const std::string& pem) {
@@ -794,6 +1011,199 @@ namespace FreeAI {
 				return it->second;
 			}
 			return "";
+		}
+
+		// =====================================================================
+		// STUN/Coordination Helper Methods
+		// =====================================================================
+
+		ExternalAddress PeerManager::QueryPeerExternalAddress(const std::string& peer_ip, int /*peer_port*/) {
+			// Query the peer's STUN server to get their external address
+			// For now, assume the peer's STUN server is on the same IP but port 3478
+			// In a real implementation, this would be configured or discovered
+			return m_punchManager.QuerySTUNServer(peer_ip, 3478);
+		}
+
+		void PeerManager::SendHolePunchInfo(const std::string& ip, int port, const std::string& peer_id,
+			                                  const ExternalAddress& peerAddr, uint64_t punchStartTime,
+			                                  uint8_t port_range) {
+			if (port_range > 0) {
+				// Send multi-port hole punch info
+				CoordHolePunchInfoMultiPayload info;
+				std::memset(&info, 0, sizeof(info));
+
+				fai_strncpy(info.peer_id, peer_id, sizeof(info.peer_id));
+
+				fai_strncpy(info.peer_ip, peerAddr.ip, sizeof(info.peer_ip));
+
+				info.peer_base_port = htons(static_cast<uint16_t>(peerAddr.port));
+				info.peer_port_range = port_range;
+				info.stun_port = htons(3478); // Default STUN port
+				info.punch_start_time = punchStartTime;
+				info.use_multi_port = 1;
+
+				SendSecurePacket(m_socket, ip, port, PT_COORD_HOLE_PUNCH_INFO,
+					&info, sizeof(info));
+
+				std::cout << "[COORD] Sent multi-port hole punch info to " << ip << ":" << port
+				          << " for peer " << peer_id << " (range: " << static_cast<int>(port_range) << " ports)" << std::endl;
+			}
+			else {
+				// Send single-port hole punch info (legacy format)
+				CoordHolePunchInfoPayload info;
+				std::memset(&info, 0, sizeof(info));
+
+				fai_strncpy(info.peer_id, peer_id, sizeof(info.peer_id));
+
+				fai_strncpy(info.peer_ip, peerAddr.ip, sizeof(info.peer_ip));
+
+				info.peer_port = htons(static_cast<uint16_t>(peerAddr.port));
+				info.stun_port = htons(3478); // Default STUN port
+				info.punch_start_time = punchStartTime;
+
+				SendSecurePacket(m_socket, ip, port, PT_COORD_HOLE_PUNCH_INFO,
+					&info, sizeof(info));
+
+				std::cout << "[COORD] Sent hole punch info to " << ip << ":" << port
+				          << " for peer " << peer_id << std::endl;
+			}
+		}
+
+		void PeerManager::SendHolePunchStart(const std::string& ip, int port, uint64_t punchStartTime) {
+			CoordHolePunchStartPayload start;
+			std::memset(&start, 0, sizeof(start));
+
+			start.punch_start_time = punchStartTime;
+
+			SendSecurePacket(m_socket, ip, port, PT_COORD_HOLE_PUNCH_START,
+				&start, sizeof(start));
+
+			std::cout << "[COORD] Sent hole punch start signal to " << ip << ":" << port << std::endl;
+		}
+
+		void PeerManager::SendCoordHolePunchFailed(const std::string& ip, int port,
+			                                          const std::string& requester_id, const std::string& target_id,
+			                                          const char* reason) {
+			// Build a simple failure message
+			std::vector<uint8_t> payload(sizeof(CoordHolePunchPayload) + 64);
+			std::memset(payload.data(), 0, payload.size());
+
+			CoordHolePunchPayload* req = reinterpret_cast<CoordHolePunchPayload*>(payload.data());
+			fai_strncpy(req->requester_id, requester_id, sizeof(req->requester_id));
+			fai_strncpy(req->target_id, target_id, sizeof(req->target_id));
+
+			// Append reason string
+			size_t reasonLen = strlen(reason);
+			std::memcpy(payload.data() + sizeof(CoordHolePunchPayload), reason, reasonLen);
+
+			SendSecurePacket(m_socket, ip, port, PT_COORD_HOLE_PUNCH_FAILED,
+				payload.data(), payload.size());
+
+			std::cerr << "[COORD] Sent failure to " << ip << ":" << port
+			          << ": " << reason << std::endl;
+		}
+
+		void PeerManager::SendPunchFailureReport(const std::string& coordinator_ip, int coordinator_port,
+		                                         const std::string& peer_id, const std::string& peer_ip,
+		                                         int peer_port, uint8_t phase) {
+			// Send failure report to the coordinator (STUN server / super node)
+			CoordHolePunchFailedPayload payload;
+			std::memset(&payload, 0, sizeof(payload));
+
+			fai_strncpy(payload.peer_id, peer_id, sizeof(payload.peer_id));
+			fai_strncpy(payload.peer_ip, peer_ip, sizeof(payload.peer_ip));
+			payload.peer_port = htons(static_cast<int16_t>(peer_port));
+			payload.phase = phase;
+			payload.is_reporter = 1; // First report
+
+			SendSecurePacket(m_socket, coordinator_ip, coordinator_port, PT_COORD_HOLE_PUNCH_FAILED,
+				&payload, sizeof(payload));
+
+			std::cout << "[FAILURE REPORT] Sending failure report for peer " << peer_id
+			          << " phase " << static_cast<int>(phase) << " to coordinator "
+			          << coordinator_ip << ":" << coordinator_port << std::endl;
+		}
+
+		void PeerManager::HandlePunchFailureReport(const std::string& /*sender_ip*/, int /*sender_port*/,
+		                                            const CoordHolePunchFailedPayload* payload) {
+			if (!m_isSuperNode) {
+				// Only the super node processes failure reports
+				return;
+			}
+
+			std::string reporter_id(payload->peer_id);
+			std::string reporter_ip(payload->peer_ip);
+			int reporter_port = ntohs(payload->peer_port);
+			uint8_t phase = payload->phase;
+
+			std::cout << "[COORD] Received failure report from peer " << reporter_id
+			          << " @ " << reporter_ip << ":" << reporter_port
+			          << " for phase " << static_cast<int>(phase) << std::endl;
+
+			// Record the failure report in HolePunchManager
+			bool bothFailed = m_punchManager.RecordFailureReport(reporter_id, reporter_ip, reporter_port, phase);
+
+			if (bothFailed) {
+				// Both peers have failed this phase - initiate next phase
+				if (phase == 0) {
+					// Both peers failed single-port - initiate multi-port punch
+					std::cout << "[COORD] Both peers failed single-port punching. Initiating multi-port punch." << std::endl;
+					
+					// Get the list of failed peers
+					auto failedPeers = m_punchManager.GetSinglePortFailedPeers();
+					
+					// For each pair of failed peers, initiate multi-port punch
+					if (failedPeers.size() >= 2) {
+						// Get external addresses for both peers
+						auto peers = GetKnownPeers();
+						std::string peerA_ip, peerB_ip;
+						int peerA_port = 0, peerB_port = 0;
+						
+						for (const auto& peer : peers) {
+							if (peer.peer_id == failedPeers[0]) {
+								peerA_ip = peer.ip;
+								peerA_port = peer.port;
+							}
+							else if (peer.peer_id == failedPeers[1]) {
+								peerB_ip = peer.ip;
+								peerB_port = peer.port;
+							}
+						}
+						
+						if (!peerA_ip.empty() && !peerB_ip.empty() && peerA_port != 0 && peerB_port != 0) {
+							// Send multi-port punch start to both peers
+							// First peer
+							CoordHolePunchMultiStartPayload multiStartA;
+							std::memset(&multiStartA, 0, sizeof(multiStartA));
+							fai_strncpy(multiStartA.peer_id, failedPeers[1], sizeof(multiStartA.peer_id));
+							fai_strncpy(multiStartA.peer_ip, peerB_ip, sizeof(multiStartA.peer_ip));
+							multiStartA.peer_base_port = htons(static_cast<int16_t>(peerB_port));
+							multiStartA.peer_port_range = 5; // Default 5 ports
+							
+							SendSecurePacket(m_socket, peerA_ip, peerA_port, PT_COORD_HOLE_PUNCH_MULTI_START,
+								&multiStartA, sizeof(multiStartA));
+							
+							// Second peer
+							CoordHolePunchMultiStartPayload multiStartB;
+							std::memset(&multiStartB, 0, sizeof(multiStartB));
+							fai_strncpy(multiStartB.peer_id, failedPeers[0], sizeof(multiStartB.peer_id));
+							fai_strncpy(multiStartB.peer_ip, peerA_ip, sizeof(multiStartB.peer_ip));
+							multiStartB.peer_base_port = htons(static_cast<int16_t>(peerA_port));
+							multiStartB.peer_port_range = 5;
+							
+							SendSecurePacket(m_socket, peerB_ip, peerB_port, PT_COORD_HOLE_PUNCH_MULTI_START,
+								&multiStartB, sizeof(multiStartB));
+							
+							std::cout << "[COORD] Sent multi-port punch coordination to both peers." << std::endl;
+						}
+					}
+				}
+				else if (phase == 1) {
+					// Both peers failed multi-port - trigger proxy fallback
+					std::cerr << "[COORD] Both peers failed multi-port punching. Triggering proxy fallback." << std::endl;
+					// Proxy fallback will be implemented separately
+				}
+			}
 		}
 
 	}

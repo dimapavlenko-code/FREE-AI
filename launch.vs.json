@@ -1,0 +1,27 @@
+{
+  "version": "0.2.1",
+  "configurations": [
+    {
+      "type": "cppvsdbg",
+      "name": "FREE-AI Debug",
+      "project": "CMakeLists.txt",
+      "projectTarget": "freeai.exe",
+      "cwd": "${workspaceRoot}\\out\\build\\x64-Debug",
+      "program": "${workspaceRoot}\\out\\build\\x64-Debug\\freeai.exe",
+      "preLaunchTask": "StartTestInstances",
+      "externalConsole": false
+    }
+  ],
+  "tasks": [
+    {
+      "label": "StartTestInstances",
+      "type": "shell",
+      "command": "cmd.exe",
+      "args": [ "/c", "${workspaceRoot}\\start_test.cmd" ],
+      "options": {
+        "cwd": "${workspaceRoot}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

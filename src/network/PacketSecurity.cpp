@@ -153,13 +153,15 @@ namespace FreeAI {
                 if (signature.empty()) {
                     header.flags &= ~FLAG_SIGNED;
                 }
+
+                //std::cout << "[SIGN] signData.size()=" << signData.size() << "; signature=" << signature << std::endl;
             }
 
             // Compress payload if large enough to benefit (threshold: 100 bytes)
             const void* finalPayload = payload;
             size_t finalPayloadSize = payloadSize;
             std::vector<uint8_t> compressedPayload;
-
+            
             if (payloadSize > 100) {
                 compressedPayload = CompressData((const uint8_t*)payload, payloadSize);
                 if (compressedPayload.size() < payloadSize) {
@@ -168,7 +170,7 @@ namespace FreeAI {
                     finalPayloadSize = compressedPayload.size();
                 }
             }
-
+            
             // Calculate total size
             size_t totalSize = 0;
 
@@ -337,6 +339,9 @@ namespace FreeAI {
                     return false;
                 }
 
+                // restore uncomressed flag in header (for signature verification)
+                outHeader.flags &= ~FLAG_COMPRESSED;
+
                 finalPayload = decompressedPayload.data();
                 finalPayloadSize = decompressedPayload.size();
             }
@@ -351,9 +356,10 @@ namespace FreeAI {
                 else {
                     // Verify against header + DECOMPRESSED payload (original data)
                     std::vector<uint8_t> signData;
-                    signData.insert(signData.begin(), packet.begin(), packet.begin() + sizeof(SecurePacketHeader));
+                    signData.insert(signData.begin(), (const uint8_t*)&outHeader, (const uint8_t*)&outHeader + sizeof(SecurePacketHeader));
                     signData.insert(signData.end(), (const uint8_t*)finalPayload, (const uint8_t*)finalPayload + finalPayloadSize);
 
+                    //std::cout << "[VERIFY] signData.size()=" << signData.size() << "; signature=" << signatureB64 << std::endl;
                     if (!Crypto::Identity::Verify(
                         signData.data(), signData.size(),
                         signatureB64, senderPubKey)) {

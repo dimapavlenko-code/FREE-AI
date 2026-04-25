@@ -1,5 +1,6 @@
 ﻿#include "network/NetworkInit.hpp"
-#include "network/PacketSecurity.hpp"  
+#include "network/PacketSecurity.hpp"
+#include "network/HolePunchManager.hpp"
 #include <iostream>
 
 #ifdef _WIN32
@@ -10,6 +11,10 @@
 
 namespace FreeAI {
     namespace Network {
+
+        // Global STUN server instance (for simple use cases)
+        static HolePunchManager g_stunManager;
+        static bool g_stunInitialized = false;
 
         bool NetworkEnvironment::Initialize() {
 #ifdef _WIN32
@@ -30,11 +35,38 @@ namespace FreeAI {
         }
 
         void NetworkEnvironment::Shutdown() {
+            ShutdownSTUNServer();
             PacketSecurity::Shutdown();
 
 #ifdef _WIN32
             WSACleanup();
 #endif
+        }
+
+        int NetworkEnvironment::InitializeSTUNServer(int port) {
+            if (g_stunInitialized) {
+                std::cerr << "[NETWORK] STUN server already initialized." << std::endl;
+                return g_stunManager.GetMyExternalAddress().port;
+            }
+
+            if (!g_stunManager.InitializeSTUNServer(port)) {
+                std::cerr << "[NETWORK] Failed to initialize STUN server on port " << port << std::endl;
+                return -1;
+            }
+
+            g_stunManager.StartSTUNServer();
+            g_stunInitialized = true;
+
+            std::cout << "[NETWORK] STUN server initialized on port " << port << std::endl;
+            return port;
+        }
+
+        void NetworkEnvironment::ShutdownSTUNServer() {
+            if (g_stunInitialized) {
+                g_stunManager.ShutdownSTUNServer();
+                g_stunInitialized = false;
+                std::cout << "[NETWORK] STUN server shut down." << std::endl;
+            }
         }
 
     }
